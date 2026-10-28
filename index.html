@@ -3,15 +3,37 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Emoji 图片编辑器</title>
+    <title>表情 Emoji 图片编辑器</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <main class="app-shell">
       <header class="toolbar">
-        <div class="brand">Emoji 图片编辑器</div>
+        <div class="brand">
+          <span class="brand-mark">✦</span>
+          <span>表情 Emoji 编辑器</span>
+        </div>
         <div class="actions">
           <label class="button primary" for="imageInput">导入图片</label>
+          <button id="recognizeButton" class="button detect-button" type="button" disabled>
+            <span class="button-icon" aria-hidden="true">✦</span>
+            识别并贴图
+          </button>
+          <div class="style-picker" role="group" aria-label="Emoji 风格">
+            <span class="style-label">风格</span>
+            <button class="style-option is-active" type="button" data-style="sticker" aria-pressed="true">
+              <span class="style-swatch sticker-swatch" aria-hidden="true">☺</span>
+              手绘
+            </button>
+            <button class="style-option" type="button" data-style="pixel" aria-pressed="false">
+              <span class="style-swatch pixel-swatch" aria-hidden="true">▪</span>
+              像素
+            </button>
+            <button class="style-option" type="button" data-style="flat" aria-pressed="false">
+              <span class="style-swatch flat-swatch" aria-hidden="true">●</span>
+              扁平
+            </button>
+          </div>
           <div class="zoom-controls" aria-label="视图缩放">
             <button id="zoomOutButton" class="button icon-button" type="button" disabled aria-label="缩小" title="缩小">−</button>
             <button id="resetViewButton" class="button fit-button" type="button" disabled>适配</button>
@@ -27,13 +49,18 @@
         <div id="canvasStage" class="canvas-stage">
           <canvas id="editorCanvas"></canvas>
           <div id="emptyState" class="empty-state">
-            <label class="button primary large" for="imageInput">导入图片</label>
+            <div class="empty-content">
+              <div class="empty-icon" aria-hidden="true">✦</div>
+              <strong>把照片变成有表情的贴纸</strong>
+              <span>导入图片后，点击“识别并贴图”自动覆盖人脸</span>
+              <label class="button primary large" for="imageInput">导入图片</label>
+            </div>
           </div>
         </div>
       </section>
       <input id="imageInput" class="file-input" type="file" accept="image/*" />
     </main>
 
-    <script src="./app.js"></script>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>

@@ -1,7 +1,10 @@
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/vision_bundle.mjs";
+
 const canvas = document.querySelector("#editorCanvas");
 const ctx = canvas.getContext("2d");
 const stage = document.querySelector("#canvasStage");
 const imageInput = document.querySelector("#imageInput");
+const recognizeButton = document.querySelector("#recognizeButton");
 const exportButton = document.querySelector("#exportButton");
 const clearButton = document.querySelector("#clearButton");
 const zoomOutButton = document.querySelector("#zoomOutButton");
@@ -9,57 +12,51 @@ const resetViewButton = document.querySelector("#resetViewButton");
 const zoomInButton = document.querySelector("#zoomInButton");
 const emptyState = document.querySelector("#emptyState");
 const statusText = document.querySelector("#statusText");
+const styleButtons = [...document.querySelectorAll("[data-style]")];
 
-const SMILEYS = [
-  "😀",
-  "😃",
-  "😄",
-  "😁",
-  "😆",
-  "😅",
-  "😂",
-  "🤣",
-  "😊",
-  "😇",
-  "🙂",
-  "🙃",
-  "😉",
-  "😌",
-  "😍",
-  "🥰",
-  "😘",
-  "😗",
-  "😙",
-  "😚",
-  "😋",
-  "😛",
-  "😝",
-  "😜",
-  "🤪",
-  "🤨",
-  "🧐",
-  "🤓",
-  "😎",
-  "🥸",
-  "🤩",
-  "🥳",
-  "😏",
-  "😒",
-  "😬",
-  "😮",
-  "😯",
-  "😲",
-  "🥹",
-  "🤗",
-  "🤭",
-  "🫢",
-  "🫣",
-  "🤫",
-  "🫡",
-  "🤤",
-];
+const MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const WASM_URL =
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/wasm";
 
-const DEFAULT_EMOJI_DISPLAY_SIZE = 72;
+const EMOTIONS = ["happy", "sad", "angry", "surprised", "neutral"];
+const EMOTION_LABELS = {
+  happy: "开心",
+  sad: "悲伤",
+  angry: "生气",
+  surprised: "惊讶",
+  neutral: "中性",
+};
+const STYLE_LABELS = {
+  sticker: "手绘",
+  pixel: "像素",
+  flat: "扁平",
+};
+const STYLE_PACKS = {
+  sticker: {
+    happy: "./assets/emoji/sticker/happy.svg",
+    sad: "./assets/emoji/sticker/sad.svg",
+    angry: "./assets/emoji/sticker/angry.svg",
+    surprised: "./assets/emoji/sticker/surprised.svg",
+    neutral: "./assets/emoji/sticker/neutral.svg",
+  },
+  pixel: {
+    happy: "./assets/emoji/pixel/happy.svg",
+    sad: "./assets/emoji/pixel/sad.svg",
+    angry: "./assets/emoji/pixel/angry.svg",
+    surprised: "./assets/emoji/pixel/surprised.svg",
+    neutral: "./assets/emoji/pixel/neutral.svg",
+  },
+  flat: {
+    happy: "./assets/emoji/flat/happy.svg",
+    sad: "./assets/emoji/flat/sad.svg",
+    angry: "./assets/emoji/flat/angry.svg",
+    surprised: "./assets/emoji/flat/surprised.svg",
+    neutral: "./assets/emoji/flat/neutral.svg",
+  },
+};
+
+const DEFAULT_EMOJI_DISPLAY_SIZE = 96;
 const MIN_EMOJI_DISPLAY_SIZE = 24;
 const BOUNDS_RATIO = 1.16;
 const HANDLE_SIZE = 9;
@@ -84,23 +81,57 @@ const state = {
   dpr: Math.max(1, window.devicePixelRatio || 1),
   annotations: [],
   selectedId: null,
-  lastEmoji: null,
   lastEmojiSize: null,
   drag: null,
+  style: "sticker",
+  detecting: false,
+  faceLandmarker: null,
+  faceLandmarkerPromise: null,
+  modelError: false,
+  assetCache: new Map(),
 };
 
 function setStatus(text) {
   statusText.textContent = text;
 }
 
+function imageStatusText() {
+  if (!state.image) {
+    return "未导入图片";
+  }
+
+  return (
+    state.imageName +
+    " · " +
+    state.imageWidth +
+    " × " +
+    state.imageHeight +
+    "px · " +
+    state.annotations.length +
+    " 个贴图 · " +
+    Math.round(state.scale * 100) +
+    "%"
+  );
+}
+
 function updateControls() {
   const hasImage = Boolean(state.image);
   exportButton.disabled = !hasImage;
   clearButton.disabled = !hasImage || state.annotations.length === 0;
+  recognizeButton.disabled = !hasImage || state.detecting;
   zoomOutButton.disabled = !hasImage;
   resetViewButton.disabled = !hasImage;
   zoomInButton.disabled = !hasImage;
   emptyState.classList.toggle("hidden", hasImage);
+}
+
+function setDetecting(isDetecting) {
+  state.detecting = isDetecting;
+  recognizeButton.classList.toggle("is-loading", isDetecting);
+  recognizeButton.innerHTML = isDetecting
+    ? "正在识别…"
+    : '<span class="button-icon" aria-hidden="true">✦</span>识别并贴图';
+  updateControls();
 }
 
 function clamp(value, min, max) {
@@ -108,7 +139,7 @@ function clamp(value, min, max) {
 }
 
 function randomIndex(max) {
-  if (window.crypto?.getRandomValues) {
+  if (window.crypto && window.crypto.getRandomValues) {
     const array = new Uint32Array(1);
     window.crypto.getRandomValues(array);
     return array[0] % max;
@@ -117,34 +148,19 @@ function randomIndex(max) {
   return Math.floor(Math.random() * max);
 }
 
-function pickEmoji() {
-  const used = new Set(state.annotations.map((annotation) => annotation.emoji));
-  let candidates = SMILEYS.filter((emoji) => !used.has(emoji));
-
-  if (candidates.length === 0) {
-    candidates = SMILEYS.filter((emoji) => emoji !== state.lastEmoji);
-  }
-
-  if (candidates.length === 0) {
-    candidates = [...SMILEYS];
-  }
-
-  return candidates[randomIndex(candidates.length)];
+function pickManualExpression() {
+  return EMOTIONS[randomIndex(EMOTIONS.length)];
 }
 
 function makeId() {
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return Date.now() + "-" + Math.random().toString(16).slice(2);
 }
 
 function getSelectedAnnotation() {
-  return state.annotations.find((annotation) => annotation.id === state.selectedId) || null;
-}
-
-function imageToCanvas(point) {
-  return {
-    x: state.panX + point.x * state.scale,
-    y: state.panY + point.y * state.scale,
-  };
+  return (
+    state.annotations.find((annotation) => annotation.id === state.selectedId) ||
+    null
+  );
 }
 
 function canvasToImage(point) {
@@ -166,7 +182,6 @@ function isInsideImage(imagePoint) {
 function clampViewScale(scale) {
   const minScale = Math.max(0.01, state.fitScale * MIN_ZOOM_RATIO);
   const maxScale = Math.max(1, state.fitScale * MAX_ZOOM_RATIO);
-
   return clamp(scale, minScale, maxScale);
 }
 
@@ -183,7 +198,6 @@ function clampPan() {
   } else {
     state.panX = clamp(state.panX, state.displayWidth - imageDisplayWidth, 0);
   }
-
   if (imageDisplayHeight <= state.displayHeight) {
     state.panY = (state.displayHeight - imageDisplayHeight) / 2;
   } else {
@@ -191,18 +205,17 @@ function clampPan() {
   }
 }
 
-function resetView(redraw = true) {
+function resetView(redraw) {
   if (!state.image) {
     return;
   }
-
   state.scale = state.fitScale;
   state.panX = (state.displayWidth - state.imageWidth * state.scale) / 2;
   state.panY = (state.displayHeight - state.imageHeight * state.scale) / 2;
   state.viewReady = true;
   clampPan();
 
-  if (redraw) {
+  if (redraw !== false) {
     draw();
   }
 }
@@ -218,7 +231,6 @@ function zoomAt(point, factor) {
   if (nextScale === state.scale) {
     return;
   }
-
   state.scale = nextScale;
   state.panX = point.x - before.x * state.scale;
   state.panY = point.y - before.y * state.scale;
@@ -227,15 +239,10 @@ function zoomAt(point, factor) {
 }
 
 function zoomFromCenter(factor) {
-  zoomAt({ x: state.displayWidth / 2, y: state.displayHeight / 2 }, factor);
-}
-
-function imageStatusText() {
-  if (!state.image) {
-    return "未导入图片";
-  }
-
-  return `${state.imageName} · ${state.imageWidth} × ${state.imageHeight}px · ${state.annotations.length} 个 emoji · ${Math.round(state.scale * 100)}%`;
+  zoomAt(
+    { x: state.displayWidth / 2, y: state.displayHeight / 2 },
+    factor,
+  );
 }
 
 function fitCanvasToStage() {
@@ -251,9 +258,11 @@ function fitCanvasToStage() {
   }
 
   const previousCenter = state.viewReady
-    ? canvasToImage({ x: state.displayWidth / 2, y: state.displayHeight / 2 })
+    ? {
+        x: (state.displayWidth / 2 - state.panX) / state.scale,
+        y: (state.displayHeight / 2 - state.panY) / state.scale,
+      }
     : null;
-
   state.displayWidth = Math.max(1, Math.round(stage.clientWidth));
   state.displayHeight = Math.max(1, Math.round(stage.clientHeight));
   state.dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -265,11 +274,10 @@ function fitCanvasToStage() {
     0.01,
     2.5,
   );
-
   canvas.width = Math.round(state.displayWidth * state.dpr);
   canvas.height = Math.round(state.displayHeight * state.dpr);
-  canvas.style.width = `${state.displayWidth}px`;
-  canvas.style.height = `${state.displayHeight}px`;
+  canvas.style.width = state.displayWidth + "px";
+  canvas.style.height = state.displayHeight + "px";
 
   if (!state.viewReady) {
     resetView(false);
@@ -279,36 +287,64 @@ function fitCanvasToStage() {
     state.panY = state.displayHeight / 2 - previousCenter.y * state.scale;
     clampPan();
   }
-
   draw();
 }
 
-function drawAnnotation(targetCtx, annotation, scale, offsetX = 0, offsetY = 0) {
-  const size = Math.max(1, annotation.size * scale);
-
-  targetCtx.save();
-  targetCtx.font = `normal ${size}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Twemoji Mozilla", sans-serif`;
-  targetCtx.textAlign = "center";
-  targetCtx.textBaseline = "middle";
-  targetCtx.fillText(annotation.emoji, offsetX + annotation.x * scale, offsetY + annotation.y * scale);
-  targetCtx.restore();
+function getAssetPath(style, expression) {
+  const pack = STYLE_PACKS[style] || STYLE_PACKS.sticker;
+  return pack[expression] || pack.neutral;
 }
 
-function getBounds(annotation, scale = state.scale) {
-  const side = annotation.size * BOUNDS_RATIO * scale;
-  const centerX = state.panX + annotation.x * scale;
-  const centerY = state.panY + annotation.y * scale;
+function loadAsset(path) {
+  if (state.assetCache.has(path)) {
+    const cached = state.assetCache.get(path);
+    return cached instanceof Promise ? cached : Promise.resolve(cached);
+  }
 
-  return {
-    left: centerX - side / 2,
-    top: centerY - side / 2,
-    right: centerX + side / 2,
-    bottom: centerY + side / 2,
-    width: side,
-    height: side,
-    centerX,
-    centerY,
-  };
+  const promise = new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      state.assetCache.set(path, image);
+      resolve(image);
+    };
+    image.onerror = () => reject(new Error("无法加载贴图资源：" + path));
+    image.src = path;
+  });
+  state.assetCache.set(path, promise);
+  return promise;
+}
+
+async function preloadStyle(style) {
+  const paths = Object.values(STYLE_PACKS[style]);
+  await Promise.all(paths.map((path) => loadAsset(path)));
+}
+
+function drawAnnotation(targetCtx, annotation, scale, offsetX, offsetY) {
+  const path = getAssetPath(annotation.style, annotation.expression);
+  const cachedAsset = state.assetCache.get(path);
+  if (!cachedAsset) {
+    loadAsset(path)
+      .then(() => draw())
+      .catch(() => {});
+    return;
+  }
+
+  if (cachedAsset instanceof Promise) {
+    cachedAsset.then(() => draw()).catch(() => {});
+    return;
+  }
+
+  const size = Math.max(1, annotation.size * scale);
+  const x = (offsetX || 0) + annotation.x * scale;
+  const y = (offsetY || 0) + annotation.y * scale;
+
+  targetCtx.save();
+  targetCtx.translate(x, y);
+  targetCtx.rotate(annotation.rotation || 0);
+  targetCtx.imageSmoothingEnabled = true;
+  targetCtx.imageSmoothingQuality = "high";
+  targetCtx.drawImage(cachedAsset, -size / 2, -size / 2, size, size);
+  targetCtx.restore();
 }
 
 function drawSelection(annotation) {
@@ -316,18 +352,22 @@ function drawSelection(annotation) {
   const handles = getHandleCenters(bounds);
 
   ctx.save();
-  ctx.strokeStyle = "#1d64d8";
+  ctx.strokeStyle = "#635bff";
   ctx.lineWidth = 2;
   ctx.setLineDash([6, 4]);
   ctx.strokeRect(bounds.left, bounds.top, bounds.width, bounds.height);
   ctx.setLineDash([]);
-
   ctx.fillStyle = "#ffffff";
-  ctx.strokeStyle = "#1d64d8";
+  ctx.strokeStyle = "#635bff";
   ctx.lineWidth = 2;
   handles.forEach((handle) => {
     ctx.beginPath();
-    ctx.rect(handle.x - HANDLE_SIZE / 2, handle.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE);
+    ctx.rect(
+      handle.x - HANDLE_SIZE / 2,
+      handle.y - HANDLE_SIZE / 2,
+      HANDLE_SIZE,
+      HANDLE_SIZE,
+    );
     ctx.fill();
     ctx.stroke();
   });
@@ -341,7 +381,6 @@ function draw() {
   if (!state.image) {
     return;
   }
-
   ctx.save();
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
@@ -364,16 +403,30 @@ function draw() {
   }
 }
 
-function getCanvasPoint(event) {
-  const rect = canvas.getBoundingClientRect();
-  const x = ((event.clientX - rect.left) / rect.width) * state.displayWidth;
-  const y = ((event.clientY - rect.top) / rect.height) * state.displayHeight;
+function getBounds(annotation, scale) {
+  const currentScale = scale || state.scale;
+  const side = annotation.size * BOUNDS_RATIO * currentScale;
+  const centerX = state.panX + annotation.x * currentScale;
+  const centerY = state.panY + annotation.y * currentScale;
 
-  return { x, y };
+  return {
+    left: centerX - side / 2,
+    top: centerY - side / 2,
+    right: centerX + side / 2,
+    bottom: centerY + side / 2,
+    width: side,
+    height: side,
+    centerX,
+    centerY,
+  };
 }
 
-function isInsideCanvas(point) {
-  return point.x >= 0 && point.x <= state.displayWidth && point.y >= 0 && point.y <= state.displayHeight;
+function getCanvasPoint(event) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: ((event.clientX - rect.left) / rect.width) * state.displayWidth,
+    y: ((event.clientY - rect.top) / rect.height) * state.displayHeight,
+  };
 }
 
 function getHandleCenters(bounds) {
@@ -403,7 +456,6 @@ function hitBorder(bounds, point) {
   if (!inExpandedBox) {
     return false;
   }
-
   return (
     Math.abs(point.x - bounds.left) <= BORDER_HIT_SIZE ||
     Math.abs(point.x - bounds.right) <= BORDER_HIT_SIZE ||
@@ -413,7 +465,12 @@ function hitBorder(bounds, point) {
 }
 
 function hitInside(bounds, point) {
-  return point.x >= bounds.left && point.x <= bounds.right && point.y >= bounds.top && point.y <= bounds.bottom;
+  return (
+    point.x >= bounds.left &&
+    point.x <= bounds.right &&
+    point.y >= bounds.top &&
+    point.y <= bounds.bottom
+  );
 }
 
 function hitSelectedBorder(point) {
@@ -431,11 +488,9 @@ function hitSelectedBorder(point) {
 }
 
 function hitAnnotation(point) {
-  for (let i = state.annotations.length - 1; i >= 0; i -= 1) {
-    const annotation = state.annotations[i];
-    const bounds = getBounds(annotation);
-
-    if (hitInside(bounds, point)) {
+  for (let index = state.annotations.length - 1; index >= 0; index -= 1) {
+    const annotation = state.annotations[index];
+    if (hitInside(getBounds(annotation), point)) {
       return { annotation, kind: "move" };
     }
   }
@@ -450,7 +505,6 @@ function loadImageFile(file) {
 
   const url = URL.createObjectURL(file);
   const image = new Image();
-
   image.onload = () => {
     URL.revokeObjectURL(url);
     state.image = image;
@@ -459,7 +513,6 @@ function loadImageFile(file) {
     state.imageHeight = image.naturalHeight;
     state.annotations = [];
     state.selectedId = null;
-    state.lastEmoji = null;
     state.lastEmojiSize = null;
     state.panX = 0;
     state.panY = 0;
@@ -467,9 +520,8 @@ function loadImageFile(file) {
 
     updateControls();
     fitCanvasToStage();
-    setStatus(imageStatusText());
+    setStatus(imageStatusText() + " · 点击“识别并贴图”开始");
   };
-
   image.onerror = () => {
     URL.revokeObjectURL(url);
     setStatus("图片读取失败");
@@ -478,27 +530,32 @@ function loadImageFile(file) {
   image.src = url;
 }
 
-function addEmojiAt(point) {
-  const emoji = pickEmoji();
+function addManualEmojiAt(point) {
   const imagePoint = canvasToImage(point);
-
   if (!isInsideImage(imagePoint)) {
-    setStatus("请在图片范围内右键添加 emoji");
+    setStatus("请在图片范围内右键添加贴图");
     return;
   }
 
+  const expression = pickManualExpression();
   const size = state.lastEmojiSize || DEFAULT_EMOJI_DISPLAY_SIZE / state.scale;
   const annotation = {
     id: makeId(),
-    emoji,
+    expression,
+    confidence: 1,
+    style: state.style,
+    assetKey: expression,
     x: imagePoint.x,
     y: imagePoint.y,
     size,
+    rotation: 0,
+    source: "manual",
   };
-
   state.annotations.push(annotation);
   state.selectedId = annotation.id;
-  state.lastEmoji = emoji;
+  preloadStyle(state.style)
+    .then(() => draw())
+    .catch(() => {});
   updateControls();
   setStatus(imageStatusText());
   draw();
@@ -555,8 +612,9 @@ function updateDrag(point) {
     draw();
     return;
   }
-
-  const annotation = state.annotations.find((item) => item.id === state.drag.id);
+  const annotation = state.annotations.find(
+    (item) => item.id === state.drag.id,
+  );
   if (!annotation) {
     state.drag = null;
     return;
@@ -568,11 +626,17 @@ function updateDrag(point) {
     annotation.x = clamp(state.drag.startX + deltaX, 0, state.imageWidth);
     annotation.y = clamp(state.drag.startY + deltaY, 0, state.imageHeight);
   }
-
   if (state.drag.kind === "resize") {
-    const distance = Math.max(Math.abs(point.x - state.drag.centerX), Math.abs(point.y - state.drag.centerY));
+    const distance = Math.max(
+      Math.abs(point.x - state.drag.centerX),
+      Math.abs(point.y - state.drag.centerY),
+    );
     const maxDisplaySize = Math.max(state.displayWidth, state.displayHeight) * 2;
-    const displaySize = clamp((distance * 2) / BOUNDS_RATIO, MIN_EMOJI_DISPLAY_SIZE, maxDisplaySize);
+    const displaySize = clamp(
+      (distance * 2) / BOUNDS_RATIO,
+      MIN_EMOJI_DISPLAY_SIZE,
+      maxDisplaySize,
+    );
     annotation.size = displaySize / state.scale;
     state.lastEmojiSize = annotation.size;
   }
@@ -582,13 +646,12 @@ function updateDrag(point) {
 
 function updateCursor(event) {
   if (state.drag) {
-    if (state.drag.kind === "resize") {
-      canvas.style.cursor = "nwse-resize";
-    } else if (state.drag.kind === "pan") {
-      canvas.style.cursor = "grabbing";
-    } else {
-      canvas.style.cursor = "move";
-    }
+    canvas.style.cursor =
+      state.drag.kind === "resize"
+        ? "nwse-resize"
+        : state.drag.kind === "pan"
+          ? "grabbing"
+          : "move";
     return;
   }
 
@@ -596,16 +659,9 @@ function updateCursor(event) {
     canvas.style.cursor = "default";
     return;
   }
-
   const point = getCanvasPoint(event);
-  const borderHit = hitSelectedBorder(point);
-  if (borderHit) {
-    canvas.style.cursor = "nwse-resize";
-    return;
-  }
-
-  const annotationHit = hitAnnotation(point);
-  canvas.style.cursor = annotationHit ? "move" : "grab";
+  canvas.style.cursor =
+    hitSelectedBorder(point) || hitAnnotation(point) ? "move" : "grab";
 }
 
 function finishDrag() {
@@ -613,20 +669,233 @@ function finishDrag() {
     return;
   }
 
-  const annotation = state.annotations.find((item) => item.id === state.drag.id);
+  const annotation = state.annotations.find(
+    (item) => item.id === state.drag.id,
+  );
   if (annotation && state.drag.kind === "resize") {
     state.lastEmojiSize = annotation.size;
   }
-
   state.drag = null;
   setStatus(imageStatusText());
   draw();
 }
 
+function toScoreMap(categories) {
+  return new Map(
+    (categories || []).map((category) => [
+      category.categoryName || category.displayName,
+      Number(category.score || 0),
+    ]),
+  );
+}
+
+function average(scores, names) {
+  if (!names.length) {
+    return 0;
+  }
+  return (
+    names.reduce((sum, name) => sum + (scores.get(name) || 0), 0) / names.length
+  );
+}
+
+function classifyExpression(categories) {
+  const scores = toScoreMap(categories);
+  const smile = average(scores, ["mouthSmileLeft", "mouthSmileRight"]);
+  const cheekSquint = average(scores, [
+    "cheekSquintLeft",
+    "cheekSquintRight",
+  ]);
+  const frown = average(scores, ["mouthFrownLeft", "mouthFrownRight"]);
+  const browDown = average(scores, ["browDownLeft", "browDownRight"]);
+  const eyeSquint = average(scores, ["eyeSquintLeft", "eyeSquintRight"]);
+  const eyeWide = average(scores, ["eyeWideLeft", "eyeWideRight"]);
+  const mouthPress = average(scores, ["mouthPressLeft", "mouthPressRight"]);
+  const browInnerUp = scores.get("browInnerUp") || 0;
+  const jawOpen = scores.get("jawOpen") || 0;
+
+  const candidates = [
+    { expression: "happy", score: smile * 0.75 + cheekSquint * 0.25 },
+    { expression: "sad", score: frown * 0.5 + browInnerUp * 0.5 },
+    {
+      expression: "angry",
+      score: browDown * 0.45 + eyeSquint * 0.25 + mouthPress * 0.3,
+    },
+    {
+      expression: "surprised",
+      score: jawOpen * 0.45 + eyeWide * 0.3 + browInnerUp * 0.25,
+    },
+  ].sort((a, b) => b.score - a.score);
+
+  const top = candidates[0];
+  const second = candidates[1] || { score: 0 };
+  if (!top || top.score < 0.35 || top.score - second.score < 0.08) {
+    return {
+      expression: "neutral",
+      confidence: clamp(1 - (top ? top.score : 0), 0.45, 0.9),
+    };
+  }
+
+  return {
+    expression: top.expression,
+    confidence: clamp(top.score, 0.35, 1),
+  };
+}
+
+function midpoint(first, second) {
+  return {
+    x: (first.x + second.x) / 2,
+    y: (first.y + second.y) / 2,
+  };
+}
+
+function faceToAnnotation(landmarks, blendshapeCategories) {
+  const xs = landmarks.map((landmark) => landmark.x);
+  const ys = landmarks.map((landmark) => landmark.y);
+  const minX = clamp(Math.min(...xs), 0, 1);
+  const maxX = clamp(Math.max(...xs), 0, 1);
+  const minY = clamp(Math.min(...ys), 0, 1);
+  const maxY = clamp(Math.max(...ys), 0, 1);
+  const width = (maxX - minX) * state.imageWidth;
+  const height = (maxY - minY) * state.imageHeight;
+  const expressionResult = classifyExpression(blendshapeCategories);
+  const leftEye = midpoint(landmarks[33], landmarks[133]);
+  const rightEye = midpoint(landmarks[263], landmarks[362]);
+  const rotation = Math.atan2(
+    (rightEye.y - leftEye.y) * state.imageHeight,
+    (rightEye.x - leftEye.x) * state.imageWidth,
+  );
+
+  return {
+    id: makeId(),
+    expression: expressionResult.expression,
+    confidence: expressionResult.confidence,
+    style: state.style,
+    assetKey: expressionResult.expression,
+    x: ((minX + maxX) / 2) * state.imageWidth,
+    y: ((minY + maxY) / 2) * state.imageHeight,
+    size: Math.max(width, height) * 1.12,
+    rotation: clamp(rotation, -0.45, 0.45),
+    source: "auto",
+  };
+}
+
+async function ensureFaceLandmarker() {
+  if (state.faceLandmarker) {
+    return state.faceLandmarker;
+  }
+  if (state.faceLandmarkerPromise) {
+    return state.faceLandmarkerPromise;
+  }
+
+  state.faceLandmarkerPromise = (async () => {
+    setStatus("正在加载表情识别模型…");
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    const landmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: MODEL_URL,
+      },
+      runningMode: "IMAGE",
+      numFaces: 10,
+      minFaceDetectionConfidence: 0.5,
+      minFacePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+      outputFaceBlendshapes: true,
+      outputFacialTransformationMatrixes: true,
+    });
+    state.faceLandmarker = landmarker;
+    state.modelError = false;
+    return landmarker;
+  })().catch((error) => {
+    state.faceLandmarkerPromise = null;
+    state.modelError = true;
+    throw error;
+  });
+
+  return state.faceLandmarkerPromise;
+}
+
+async function recognizeFaces() {
+  if (!state.image || state.detecting) {
+    return;
+  }
+
+  setDetecting(true);
+  setStatus("正在识别人脸和表情…");
+  try {
+    await Promise.all([ensureFaceLandmarker(), preloadStyle(state.style)]);
+    const result = state.faceLandmarker.detect(state.image);
+    const faces = result.faceLandmarks || [];
+    if (!faces.length) {
+      state.annotations = [];
+      state.selectedId = null;
+      updateControls();
+      draw();
+      setStatus("未检测到可识别的人脸");
+      return;
+    }
+
+    state.annotations = faces.map((landmarks, index) =>
+      faceToAnnotation(
+        landmarks,
+        result.faceBlendshapes?.[index]?.categories || [],
+      ),
+    );
+    state.selectedId = state.annotations[0]?.id || null;
+    updateControls();
+    draw();
+    const labels = state.annotations
+      .map((annotation) => EMOTION_LABELS[annotation.expression])
+      .join("、");
+    setStatus(
+      "已识别 " +
+        state.annotations.length +
+        " 张脸 · " +
+        labels +
+        " · " +
+        STYLE_LABELS[state.style] +
+        "风格",
+    );
+  } catch (error) {
+    console.error(error);
+    setStatus("识别服务加载失败，请检查网络后重试；手动贴图仍可用");
+  } finally {
+    setDetecting(false);
+  }
+}
+
+async function selectStyle(style) {
+  if (!STYLE_PACKS[style] || state.style === style) {
+    return;
+  }
+
+  state.style = style;
+  styleButtons.forEach((button) => {
+    const active = button.dataset.style === style;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+
+  try {
+    await preloadStyle(style);
+    state.annotations.forEach((annotation) => {
+      annotation.style = style;
+      annotation.assetKey = annotation.expression;
+    });
+    draw();
+    setStatus(
+      state.image
+        ? imageStatusText() + " · 已切换为" + STYLE_LABELS[style] + "风格"
+        : "已选择" + STYLE_LABELS[style] + "风格",
+    );
+  } catch (error) {
+    console.error(error);
+    setStatus("风格资源加载失败，请稍后重试");
+  }
+}
+
 function downloadBlob(blob, fileName) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-
   link.href = url;
   link.download = fileName;
   document.body.append(link);
@@ -635,38 +904,42 @@ function downloadBlob(blob, fileName) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function exportEditedImage() {
+async function exportEditedImage() {
   if (!state.image) {
+    return;
+  }
+
+  try {
+    await preloadStyle(state.style);
+  } catch (error) {
+    setStatus("贴图资源加载失败，无法导出");
     return;
   }
 
   const output = document.createElement("canvas");
   output.width = state.imageWidth;
   output.height = state.imageHeight;
-
   const outputCtx = output.getContext("2d");
   outputCtx.imageSmoothingEnabled = true;
   outputCtx.imageSmoothingQuality = "high";
   outputCtx.drawImage(state.image, 0, 0, state.imageWidth, state.imageHeight);
   state.annotations.forEach((annotation) => {
-    drawAnnotation(outputCtx, annotation, 1);
+    drawAnnotation(outputCtx, annotation, 1, 0, 0);
   });
-
   const baseName = state.imageName.replace(/\.[^.]+$/, "") || "image";
   output.toBlob((blob) => {
     if (blob) {
-      downloadBlob(blob, `${baseName}-emoji.png`);
-      setStatus(`已导出 ${state.imageWidth} × ${state.imageHeight}px`);
+      downloadBlob(blob, baseName + "-emoji.png");
+      setStatus("已导出 " + state.imageWidth + " × " + state.imageHeight + "px");
       return;
     }
-
     const link = document.createElement("a");
     link.href = output.toDataURL("image/png");
-    link.download = `${baseName}-emoji.png`;
+    link.download = baseName + "-emoji.png";
     document.body.append(link);
     link.click();
     link.remove();
-    setStatus(`已导出 ${state.imageWidth} × ${state.imageHeight}px`);
+    setStatus("已导出 " + state.imageWidth + " × " + state.imageHeight + "px");
   }, "image/png");
 }
 
@@ -675,14 +948,18 @@ imageInput.addEventListener("change", (event) => {
   event.target.value = "";
 });
 
+recognizeButton.addEventListener("click", recognizeFaces);
 exportButton.addEventListener("click", exportEditedImage);
-
 clearButton.addEventListener("click", () => {
   state.annotations = [];
   state.selectedId = null;
   updateControls();
   setStatus(imageStatusText());
   draw();
+});
+
+styleButtons.forEach((button) => {
+  button.addEventListener("click", () => selectStyle(button.dataset.style));
 });
 
 zoomOutButton.addEventListener("click", () => {
@@ -702,18 +979,20 @@ resetViewButton.addEventListener("click", () => {
 
 canvas.addEventListener("contextmenu", (event) => {
   event.preventDefault();
-
   if (!state.image) {
     setStatus("请先导入图片");
     return;
   }
 
   const point = getCanvasPoint(event);
-  if (!isInsideCanvas(point)) {
-    return;
+  if (
+    point.x >= 0 &&
+    point.x <= state.displayWidth &&
+    point.y >= 0 &&
+    point.y <= state.displayHeight
+  ) {
+    addManualEmojiAt(point);
   }
-
-  addEmojiAt(point);
 });
 
 canvas.addEventListener(
@@ -722,11 +1001,8 @@ canvas.addEventListener(
     if (!state.image) {
       return;
     }
-
     event.preventDefault();
-    const point = getCanvasPoint(event);
-    const factor = Math.exp(-event.deltaY * 0.0015);
-    zoomAt(point, factor);
+    zoomAt(getCanvasPoint(event), Math.exp(-event.deltaY * 0.0015));
     setStatus(imageStatusText());
   },
   { passive: false },
@@ -740,7 +1016,6 @@ canvas.addEventListener("pointerdown", (event) => {
   const point = getCanvasPoint(event);
   const resizeHit = hitSelectedBorder(point);
   const hit = resizeHit || hitAnnotation(point);
-
   if (!hit) {
     event.preventDefault();
     state.selectedId = null;
@@ -752,26 +1027,22 @@ canvas.addEventListener("pointerdown", (event) => {
 
   event.preventDefault();
   state.selectedId = hit.annotation.id;
-
   if (hit.kind === "resize") {
     startResize(hit.annotation, point, event.pointerId);
   } else {
     startMove(hit.annotation, point, event.pointerId);
   }
-
   canvas.setPointerCapture(event.pointerId);
   draw();
 });
 
 canvas.addEventListener("pointermove", (event) => {
   const point = getCanvasPoint(event);
-
   if (state.drag) {
     event.preventDefault();
     updateDrag(point);
     return;
   }
-
   updateCursor(event);
 });
 
@@ -789,13 +1060,17 @@ canvas.addEventListener("pointercancel", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
-  if (!state.selectedId || (event.key !== "Delete" && event.key !== "Backspace")) {
+  if (
+    !state.selectedId ||
+    (event.key !== "Delete" && event.key !== "Backspace")
+  ) {
     return;
   }
 
   const before = state.annotations.length;
-  state.annotations = state.annotations.filter((annotation) => annotation.id !== state.selectedId);
-
+  state.annotations = state.annotations.filter(
+    (annotation) => annotation.id !== state.selectedId,
+  );
   if (state.annotations.length !== before) {
     state.selectedId = null;
     updateControls();

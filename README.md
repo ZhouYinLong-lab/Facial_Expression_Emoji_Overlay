@@ -1,68 +1,141 @@
-# 表情 Emoji 图片编辑器
+# Emoji Mask · 表情人脸贴图
 
-一个本地网页小工具：上传图片后，在浏览器中识别人脸和近似表情，并自动覆盖 Unicode emoji，最后导出清晰 PNG 图片。
+[![在线体验](https://img.shields.io/badge/GitHub%20Pages-在线体验-2856E8?logo=github)](https://zhouyinlong-lab.github.io/Facial_Expression_Emoji_Overlay/)
+[![JavaScript](https://img.shields.io/badge/JavaScript-原生-F7DF1E?logo=javascript&logoColor=111)](https://developer.mozilla.org/zh-CN/docs/Web/JavaScript)
+[![MediaPipe](https://img.shields.io/badge/MediaPipe-Tasks%20Vision-00A67E)](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker/web_js)
+[![隐私](https://img.shields.io/badge/图片处理-仅在浏览器本地-16855B)](#隐私与模型加载)
 
-![应用展示](assets/demo.png)
+上传一张合影，自动找到人脸、判断基础表情，并用 Unicode Emoji 遮住每张脸。贴图可以继续移动、缩放、替换，最终按原图尺寸导出 PNG。
 
-## 功能
+**[打开在线版本](https://zhouyinlong-lab.github.io/Facial_Expression_Emoji_Overlay/)** · 无需安装，不会上传照片。
 
-- 导入本地图片进行编辑
-- 使用 MediaPipe Face Detector 对整图和多尺度重叠分块进行人脸检测
-- 仅对面积最大的前 6 张脸运行 Face Landmarker，根据 blendshape 近似识别开心、悲伤、生气、惊讶、中性五类表情
-- 其余人脸默认使用开心 emoji，确保检测到的人脸都能立即遮住
-- 自动将对应 Unicode emoji 覆盖到每张脸上
-- 支持选中单张贴图后手动修改表情
-- 在图片上右键添加开心 emoji
-- 左键拖动 emoji 可移动位置
-- 拖拽 emoji 的选中边框可等比例放大或缩小
-- 新增 emoji 会沿用最近一次调整后的尺寸
-- 支持滚轮缩放图片视图、拖拽平移图片
-- 导出 PNG 时按原始图片尺寸重新绘制，保持画质清晰
+![Emoji Mask 工作台](assets/demo.png)
+
+## 主要功能
+
+- 检测近景人像和多人合影，单次最多保留 30 张脸
+- 对面积最大的 6 张脸进一步识别开心、悲伤、生气、惊讶和中性表情
+- 未进入表情层或判断不确定的人脸默认使用 `😄`，保证检测到就会被遮住
+- 支持拖动、等比例缩放、删除和手动替换单个 Emoji
+- 支持滚轮缩放、画布平移和右键手动添加贴图
+- 按原始图片分辨率导出 PNG，视图缩放不会影响导出位置
+- Face Landmarker 不可用时仍可依靠 Face Detector 生成开心贴图
+
+## 工作原理
+
+项目使用两层识别流程，在“找全人脸”和“判断表情”之间取平衡：
+
+```text
+原始图片
+   │
+   ├─ Face Detector：整图 + 多尺度重叠分块
+   │      └─ 合并重复框，为每张脸先生成 😄
+   │
+   └─ Face Landmarker：处理面积最大的前 6 张脸
+          └─ 用关键点和 blendshape 更新表情、位置、大小与旋转
+```
+
+| 阶段 | 作用 | 限制 |
+| --- | --- | --- |
+| 人脸层 | 尽量找全合影中的人脸 | 最多 30 张 |
+| 表情层 | 细化表情和贴图位置 | 面积最大的前 6 张 |
+| 编辑层 | 手动修正识别结果 | Unicode Emoji |
 
 ## 使用方法
 
-项目不需要安装依赖或启动后端服务，但由于浏览器的 ES Module 和本地文件安全限制，建议通过本地静态服务打开。
+1. 选择照片，或把图片拖到画布中。
+2. 点击“识别并贴图”。多人合影通常需要几秒钟。
+3. 点击任意 Emoji 进行选中，拖动可移动，拖动选中边框可缩放。
+4. 在左侧表情栏中修正误判；按 `Delete` 或 `Backspace` 删除选中项。
+5. 点击“导出 PNG”保存结果。
 
-1. 点击“导入图片”选择本地图片。
-2. 点击“识别并贴图”，自动处理图片中的全部人脸。多人合影会自动进行多尺度分块检测，单次最多处理 30 张脸；面积最大的前 6 张会进一步识别表情。
-3. 左键拖动 emoji 调整位置，拖动边框调整大小。
-4. 选中贴图后，可以从顶部 Unicode 表情栏修改它的表情。
-5. 也可以在图片上右键添加开心 emoji。
-6. 使用鼠标滚轮缩放图片视图，拖拽空白图片区域平移视图。
-7. 点击“导出 PNG”保存编辑后的图片。
+### 编辑操作
 
-如果浏览器对本地文件访问限制较严格，也可以在项目目录运行本地静态服务：
+| 操作 | 效果 |
+| --- | --- |
+| 拖动 Emoji | 移动贴图 |
+| 拖动选中边框 | 等比例缩放贴图 |
+| 拖动画布空白处 | 平移视图 |
+| 鼠标滚轮 | 以指针位置为中心缩放 |
+| 图片区域右键 | 手动添加开心 Emoji |
+| `Delete` / `Backspace` | 删除选中贴图 |
+
+## 本地运行
+
+项目使用原生 HTML、CSS 和 JavaScript，不需要安装依赖或构建工具。ES Module 不能稳定地从 `file://` 直接加载，请通过静态服务器运行：
 
 ```powershell
+git clone https://github.com/ZhouYinLong-lab/Facial_Expression_Emoji_Overlay.git
+cd Facial_Expression_Emoji_Overlay
 python -m http.server 5173 --bind 127.0.0.1
 ```
 
-然后访问：
+打开 [http://127.0.0.1:5173/](http://127.0.0.1:5173/)。推荐使用最新版 Chrome 或 Edge。
 
-```text
-http://127.0.0.1:5173/
-```
+## 隐私与模型加载
+
+- 图片、关键点和编辑结果只存在于当前浏览器页面，不会上传到项目服务器。
+- Face Detector 和 Face Landmarker 模型存放在 `assets/models/`，由站点同源加载。
+- MediaPipe Tasks Vision 运行时通过 jsDelivr CDN 加载，因此首次打开和首次识别需要网络。
+- 两个模型都不可用时，右键手动添加、调整和 PNG 导出仍可使用。
+
+> 表情分类来自面部 blendshape 的规则组合，只适合趣味图片编辑，不代表医学或心理层面的情绪判断。
 
 ## 项目结构
 
 ```text
-.
-├── index.html
-├── styles.css
-├── app.js
+Facial_Expression_Emoji_Overlay/
+├── index.html                 # 工作台结构与无障碍标签
+├── styles.css                # 响应式界面与交互状态
+├── app.js                    # 检测、表情规则、画布编辑与导出
 ├── assets/
-│   ├── demo.png
-│   ├── emoji/        # 预留的后续风格资源，第一阶段不参与运行
-│   └── models/       # 同源加载的官方 MediaPipe 人脸模型
+│   ├── demo.png              # README 展示图
+│   ├── emoji/                # 后续自定义表情资源预留目录
+│   └── models/
+│       ├── blaze_face_full_range.tflite
+│       ├── face_landmarker.task
+│       └── README.md          # 模型来源与校验值
 └── README.md
 ```
 
-## 技术说明
+## 技术细节
 
-项目使用原生 HTML、CSS 和 JavaScript 实现。MediaPipe 运行时通过 CDN 加载，Face Detector 和 Face Landmarker 官方模型随静态站点同源提供，项目无需构建工具或后端服务。图片和识别结果只在浏览器本地处理，不会上传到服务器。
+- **人脸检测：** MediaPipe Face Detector + BlazeFace full-range
+- **表情与关键点：** MediaPipe Face Landmarker，478 个面部关键点和 blendshape
+- **多人合影：** 整图检测后按 4 个尺度做 50% 重叠分块，再通过 IoU 和交集比例去重
+- **渲染：** Canvas 2D `fillText()` 绘制 Unicode Emoji
+- **坐标：** 贴图始终保存在原图坐标系；缩放和平移只作用于预览
+- **部署：** 纯静态 GitHub Pages，无后端
 
-编辑数据保存在原始图片坐标系中，页面缩放和平移只影响预览视图；导出时会在离屏 canvas 中按原图尺寸重新绘制图片和 Unicode emoji。
+模型文件的官方来源与 SHA-256 校验值见 [assets/models/README.md](assets/models/README.md)。
 
-识别采用两层结构：Face Detector 先处理整张图片和多个尺度的重叠分块，合并重复人脸框并为所有结果生成开心 emoji；Face Landmarker 再逐张处理面积最大的前 6 张脸，使用更精确的关键点和表情结果更新贴图。识别设置了约 9 秒的时间预算和 30 张脸的结果上限；侧脸、严重遮挡或尺寸过小的人脸仍可能无法识别。全部处理都在浏览器本地完成，不会上传图片。
+## 已知限制
 
-表情识别是基于面部 blendshape 的近似分类，适合生成趣味贴纸，不代表医学或心理层面的情绪判断。无法明确判断、超过表情层人数上限或表情模型不可用时默认使用开心 emoji。Face Detector 不可用时会回退到 Face Landmarker 整图识别；两个模型都加载失败时仍可使用右键手动贴图和导出功能。不同操作系统和浏览器可能使用不同 emoji 字体，因此 Unicode emoji 的具体视觉样式会略有差异。首次识别需要网络加载 MediaPipe 运行时和模型。
+- 侧脸、严重遮挡、模糊或小于约 10–18px 的远处人脸可能漏检。
+- Unicode Emoji 的具体外观由操作系统和浏览器决定，预览风格可能不同。
+- 为控制耗时，表情层只处理面积最大的 6 张脸，其余人脸默认开心。
+- 当前版本不处理视频或摄像头实时画面。
+
+## 路线图
+
+- [ ] 增加原创或授权明确的“大黄脸”表情资源层
+- [ ] 支持更多表情和单脸置信度展示
+- [ ] 为触屏设备增加更直观的缩放手柄与删除按钮
+- [ ] 将 MediaPipe 运行时也改为可选的同源离线加载
+
+## 反馈与贡献
+
+发现漏检、重复贴图或界面问题时，请在 [GitHub Issues](https://github.com/ZhouYinLong-lab/Facial_Expression_Emoji_Overlay/issues) 提交：
+
+- 可复现的图片特征（人数、距离、遮挡情况）
+- 浏览器与操作系统版本
+- 实际结果和预期结果
+
+欢迎通过 Fork 和 Pull Request 改进检测规则、交互体验或文档。
+
+## 致谢
+
+- [MediaPipe](https://github.com/google-ai-edge/mediapipe) 提供浏览器端视觉任务运行时与官方模型
+- [GitHub Pages](https://pages.github.com/) 提供静态站点托管
+
+本仓库目前未声明独立的项目许可证。MediaPipe 及模型文件适用其各自的许可证；复用项目前请先确认授权范围。

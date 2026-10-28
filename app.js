@@ -9,6 +9,7 @@ const ctx = canvas.getContext("2d");
 const stage = document.querySelector("#canvasStage");
 const imageInput = document.querySelector("#imageInput");
 const recognizeButton = document.querySelector("#recognizeButton");
+const recognizeLabel = document.querySelector("#recognizeLabel");
 const exportButton = document.querySelector("#exportButton");
 const clearButton = document.querySelector("#clearButton");
 const zoomOutButton = document.querySelector("#zoomOutButton");
@@ -16,6 +17,7 @@ const resetViewButton = document.querySelector("#resetViewButton");
 const zoomInButton = document.querySelector("#zoomInButton");
 const emptyState = document.querySelector("#emptyState");
 const statusText = document.querySelector("#statusText");
+const selectionHint = document.querySelector("#selectionHint");
 const unicodeButtons = [...document.querySelectorAll("[data-expression]")];
 
 const FACE_LANDMARKER_MODEL_URL = new URL(
@@ -97,6 +99,17 @@ const state = {
 
 function setStatus(text) {
   statusText.textContent = text;
+  if (text.includes("正在")) {
+    statusText.dataset.state = "loading";
+  } else if (text.includes("失败") || text.includes("不可用")) {
+    statusText.dataset.state = "error";
+  } else if (text.includes("未检测") || text.includes("请先")) {
+    statusText.dataset.state = "warning";
+  } else if (text.includes("已") || text.includes("检测到")) {
+    statusText.dataset.state = "success";
+  } else {
+    statusText.dataset.state = "neutral";
+  }
 }
 
 function imageStatusText() {
@@ -128,6 +141,9 @@ function updateControls() {
   zoomInButton.disabled = !hasImage;
   emptyState.classList.toggle("hidden", hasImage);
   const selected = getSelectedAnnotation();
+  selectionHint.textContent = selected
+    ? "已选中“" + EMOTION_LABELS[selected.expression] + "”贴图"
+    : "先在画布中选中一个贴图";
   unicodeButtons.forEach((button) => {
     const active = Boolean(selected && selected.expression === button.dataset.expression);
     button.classList.toggle("is-active", active);
@@ -139,9 +155,7 @@ function updateControls() {
 function setDetecting(isDetecting) {
   state.detecting = isDetecting;
   recognizeButton.classList.toggle("is-loading", isDetecting);
-  recognizeButton.innerHTML = isDetecting
-    ? "正在识别…"
-    : '<span class="button-icon" aria-hidden="true">✦</span>识别并贴图';
+  recognizeLabel.textContent = isDetecting ? "正在识别…" : "识别并贴图";
   updateControls();
 }
 
@@ -458,6 +472,11 @@ function hitAnnotation(point) {
 
 function loadImageFile(file) {
   if (!file) {
+    return;
+  }
+
+  if (!file.type.startsWith("image/")) {
+    setStatus("请选择 JPG、PNG、WebP 等图片文件");
     return;
   }
 
@@ -1585,6 +1604,28 @@ imageInput.addEventListener("change", (event) => {
   event.target.value = "";
 });
 
+for (const eventName of ["dragenter", "dragover"]) {
+  stage.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+    stage.classList.add("is-dragover");
+  });
+}
+
+stage.addEventListener("dragleave", (event) => {
+  if (!stage.contains(event.relatedTarget)) {
+    stage.classList.remove("is-dragover");
+  }
+});
+
+stage.addEventListener("drop", (event) => {
+  event.preventDefault();
+  stage.classList.remove("is-dragover");
+  loadImageFile(event.dataTransfer?.files?.[0]);
+});
+
 recognizeButton.addEventListener("click", recognizeFaces);
 exportButton.addEventListener("click", exportEditedImage);
 clearButton.addEventListener("click", () => {
@@ -1728,4 +1769,5 @@ if ("ResizeObserver" in window) {
 }
 
 updateControls();
+setStatus("未导入图片");
 fitCanvasToStage();

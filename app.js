@@ -18,10 +18,14 @@ const emptyState = document.querySelector("#emptyState");
 const statusText = document.querySelector("#statusText");
 const unicodeButtons = [...document.querySelectorAll("[data-expression]")];
 
-const FACE_LANDMARKER_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
-const FACE_DETECTOR_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/1/blaze_face_full_range.tflite";
+const FACE_LANDMARKER_MODEL_URL = new URL(
+  "./assets/models/face_landmarker.task",
+  import.meta.url,
+).href;
+const FACE_DETECTOR_MODEL_URL = new URL(
+  "./assets/models/blaze_face_full_range.tflite",
+  import.meta.url,
+).href;
 const WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/wasm";
 

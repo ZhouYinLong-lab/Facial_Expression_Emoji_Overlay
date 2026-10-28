@@ -52,13 +52,14 @@ http://127.0.0.1:5173/
 ├── app.js
 ├── assets/
 │   ├── demo.png
-│   └── emoji/        # 预留的后续风格资源，第一阶段不参与运行
+│   ├── emoji/        # 预留的后续风格资源，第一阶段不参与运行
+│   └── models/       # 同源加载的官方 MediaPipe 人脸模型
 └── README.md
 ```
 
 ## 技术说明
 
-项目使用原生 HTML、CSS 和 JavaScript 实现。MediaPipe 运行时和 Face Landmarker 模型通过 CDN 加载，项目无需构建工具或后端服务。图片和识别结果只在浏览器本地处理，不会上传到服务器。
+项目使用原生 HTML、CSS 和 JavaScript 实现。MediaPipe 运行时通过 CDN 加载，Face Detector 和 Face Landmarker 官方模型随静态站点同源提供，项目无需构建工具或后端服务。图片和识别结果只在浏览器本地处理，不会上传到服务器。
 
 编辑数据保存在原始图片坐标系中，页面缩放和平移只影响预览视图；导出时会在离屏 canvas 中按原图尺寸重新绘制图片和 Unicode emoji。
 

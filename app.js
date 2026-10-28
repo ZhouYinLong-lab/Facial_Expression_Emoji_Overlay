@@ -699,9 +699,9 @@ function faceToAnnotation(landmarks, blendshapeCategories) {
     x: ((minX + maxX) / 2) * state.imageWidth,
     y: (((minY + maxY) / 2) + (maxY - minY) * 0.035) * state.imageHeight,
     size: clamp(
-      Math.max(width * 1.12, height * 0.94),
+      Math.max(width * 1.35, height * 1.1),
       36,
-      Math.max(state.imageWidth, state.imageHeight) * 0.36,
+      Math.max(state.imageWidth, state.imageHeight) * 0.45,
     ),
     rotation: clamp(rotation, -0.21, 0.21),
     source: "auto",

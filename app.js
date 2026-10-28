@@ -1,4 +1,8 @@
-import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/vision_bundle.mjs";
+import {
+  FaceDetector,
+  FaceLandmarker,
+  FilesetResolver,
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/vision_bundle.mjs";
 
 const canvas = document.querySelector("#editorCanvas");
 const ctx = canvas.getContext("2d");
@@ -14,8 +18,10 @@ const emptyState = document.querySelector("#emptyState");
 const statusText = document.querySelector("#statusText");
 const unicodeButtons = [...document.querySelectorAll("[data-expression]")];
 
-const MODEL_URL =
+const FACE_LANDMARKER_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const FACE_DETECTOR_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/1/blaze_face_full_range.tflite";
 const WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/wasm";
 
@@ -44,16 +50,21 @@ const STAGE_PADDING = 28;
 const MIN_ZOOM_RATIO = 0.25;
 const MAX_ZOOM_RATIO = 12;
 const MAX_AUTO_FACES = 30;
+const MAX_EXPRESSION_FACES = 6;
 const MAX_DETECTION_DIMENSION = 2400;
-const DETECTION_TILE_SIZE = 960;
-const FINE_DETECTION_TILE_SIZE = 640;
-const DETECTION_TILE_OVERLAP = 0.25;
-const DETECTION_TILE_RENDER_SIZE = 1280;
-const MAX_DETECTION_TILES = 12;
+const DETECTION_TILE_SCALES = [0.62, 0.4, 0.26, 0.17];
+const DETECTION_TILE_OVERLAP = 0.5;
+const DETECTION_TILE_RENDER_SIZE = 512;
 const DETECTION_TIME_BUDGET_MS = 9000;
-const MIN_DETECTED_FACE_SIZE = 18;
+const DETECTOR_MIN_CONFIDENCE = 0.25;
+const FULL_IMAGE_MIN_SCORE = 0.55;
+const TILE_MIN_SCORE = 0.6;
+const STRONG_SINGLE_SCORE = 0.85;
+const MIN_DETECTED_FACE_SIZE = 10;
 const FACE_DEDUPE_IOU = 0.35;
-const FACE_DEDUPE_CENTER_RATIO = 0.45;
+const FACE_DEDUPE_IOMIN = 0.7;
+const EXPRESSION_CROP_SCALE = 2.2;
+const EXPRESSION_CROP_SIZE = 256;
 
 const state = {
   image: null,
@@ -73,6 +84,9 @@ const state = {
   lastEmojiSize: null,
   drag: null,
   detecting: false,
+  visionPromise: null,
+  faceDetector: null,
+  faceDetectorPromise: null,
   faceLandmarker: null,
   faceLandmarkerPromise: null,
 };
@@ -727,7 +741,7 @@ function createDetectionCanvas() {
   return detectionCanvas;
 }
 
-function buildTileStarts(length, tileSize = DETECTION_TILE_SIZE) {
+function buildDetectorAxisStarts(length, tileSize) {
   if (length <= tileSize) {
     return [0];
   }
@@ -749,145 +763,210 @@ function buildTileStarts(length, tileSize = DETECTION_TILE_SIZE) {
   return starts;
 }
 
-function takeEvenlyDistributed(items, limit) {
-  if (items.length <= limit) {
-    return items;
-  }
-  if (limit <= 0) {
-    return [];
-  }
-  if (limit === 1) {
-    return [items[Math.floor(items.length / 2)]];
-  }
+function buildDetectorJobs(width, height) {
+  const shortSide = Math.min(width, height);
+  const jobs = [];
 
-  return Array.from({ length: limit }, (_, index) => {
-    const itemIndex = Math.round((index * (items.length - 1)) / (limit - 1));
-    return items[itemIndex];
-  });
-}
-
-function buildDetectionTiles(
-  width,
-  height,
-  tileSize = DETECTION_TILE_SIZE,
-) {
-  if (width <= tileSize && height <= tileSize) {
-    return [];
-  }
-
-  const columns = buildTileStarts(width, tileSize);
-  const rows = buildTileStarts(height, tileSize);
-  const tiles = [];
-  rows.forEach((y) => {
-    columns.forEach((x) => {
-      tiles.push({
-        x,
-        y,
-        width: Math.min(tileSize, width - x),
-        height: Math.min(tileSize, height - y),
+  DETECTION_TILE_SCALES.forEach((fraction) => {
+    const tileSize = Math.round(shortSide * fraction);
+    if (tileSize < 96 || tileSize >= Math.max(width, height)) {
+      return;
+    }
+    const columns = buildDetectorAxisStarts(width, tileSize);
+    const rows = buildDetectorAxisStarts(height, tileSize);
+    rows.forEach((y) => {
+      columns.forEach((x) => {
+        jobs.push({ x, y, width: tileSize, height: tileSize });
       });
     });
   });
-  return takeEvenlyDistributed(tiles, MAX_DETECTION_TILES);
+
+  return jobs;
 }
 
-function mapLandmarksToImage(landmarks, crop, sourceWidth, sourceHeight) {
-  return landmarks.map((landmark) => ({
-    ...landmark,
-    x: clamp((crop.x + landmark.x * crop.width) / sourceWidth, 0, 1),
-    y: clamp((crop.y + landmark.y * crop.height) / sourceHeight, 0, 1),
-  }));
+function mapDetectorPoint(point, crop, sourceWidth, sourceHeight) {
+  return {
+    x: ((crop.x + point.x * crop.width) / sourceWidth) * state.imageWidth,
+    y: ((crop.y + point.y * crop.height) / sourceHeight) * state.imageHeight,
+  };
 }
 
-function collectDetections(result, crop, sourceWidth, sourceHeight) {
-  return (result.faceLandmarks || [])
-    .map((landmarks, index) => {
-      const globalLandmarks = mapLandmarksToImage(
-        landmarks,
-        crop,
-        sourceWidth,
-        sourceHeight,
-      );
-      const bounds = getLandmarkBounds(
-        globalLandmarks,
-        state.imageWidth,
-        state.imageHeight,
-      );
-      const localBounds = getLandmarkBounds(landmarks, 1, 1);
+function hasPlausibleKeypoints(keypoints, box) {
+  if (keypoints.length < 4) {
+    return false;
+  }
+  const eyes = [keypoints[0], keypoints[1]].sort(
+    (first, second) => first.x - second.x,
+  );
+  const nose = keypoints[2];
+  const mouth = keypoints[3];
+  const eyeDistance = Math.hypot(
+    eyes[1].x - eyes[0].x,
+    eyes[1].y - eyes[0].y,
+  );
+  const eyeMidpoint = midpoint(eyes[0], eyes[1]);
+  const faceSize = Math.max(box.width, box.height);
 
-      if (
-        Math.min(bounds.width, bounds.height) < MIN_DETECTED_FACE_SIZE
-      ) {
+  return (
+    eyeDistance > faceSize * 0.12 &&
+    eyeDistance < faceSize * 0.9 &&
+    Math.hypot(mouth.x - eyeMidpoint.x, mouth.y - eyeMidpoint.y) >
+      eyeDistance * 0.4 &&
+    Math.hypot(nose.x - eyeMidpoint.x, nose.y - eyeMidpoint.y) <
+      eyeDistance * 1.5
+  );
+}
+
+function collectDetectorCandidates(
+  result,
+  crop,
+  sourceWidth,
+  sourceHeight,
+  isFullImage,
+) {
+  const scaleX = state.imageWidth / sourceWidth;
+  const scaleY = state.imageHeight / sourceHeight;
+  const minimumScore = isFullImage
+    ? FULL_IMAGE_MIN_SCORE
+    : TILE_MIN_SCORE;
+
+  return (result.detections || [])
+    .map((detection) => {
+      const score = Number(detection.categories?.[0]?.score || 0);
+      const sourceBox = detection.boundingBox;
+      if (!sourceBox || score < minimumScore) {
         return null;
       }
 
+      const box = {
+        x: (crop.x + sourceBox.originX * (crop.width / crop.inputWidth)) * scaleX,
+        y: (crop.y + sourceBox.originY * (crop.height / crop.inputHeight)) * scaleY,
+        width: sourceBox.width * (crop.width / crop.inputWidth) * scaleX,
+        height: sourceBox.height * (crop.height / crop.inputHeight) * scaleY,
+      };
+      if (Math.min(box.width, box.height) < MIN_DETECTED_FACE_SIZE) {
+        return null;
+      }
+
+      const keypoints = (detection.keypoints || []).map((point) =>
+        mapDetectorPoint(point, crop, sourceWidth, sourceHeight),
+      );
+      if (!hasPlausibleKeypoints(keypoints, box)) {
+        return null;
+      }
+
+      const eyes = [keypoints[0], keypoints[1]].sort(
+        (first, second) => first.x - second.x,
+      );
       return {
-        landmarks: globalLandmarks,
-        blendshapeCategories: result.faceBlendshapes?.[index]?.categories || [],
-        bounds,
-        quality: localBounds.area,
+        box,
+        score,
+        hits: 1,
+        fullHit: isFullImage,
+        eyeLeft: eyes[0],
+        eyeRight: eyes[1],
       };
     })
     .filter(Boolean);
 }
 
-function intersectionOverUnion(first, second) {
-  const intersectionLeft = Math.max(first.left, second.left);
-  const intersectionTop = Math.max(first.top, second.top);
-  const intersectionRight = Math.min(first.right, second.right);
-  const intersectionBottom = Math.min(first.bottom, second.bottom);
+function boxArea(box) {
+  return Math.max(0, box.width) * Math.max(0, box.height);
+}
+
+function boxIntersection(first, second) {
+  const intersectionLeft = Math.max(first.x, second.x);
+  const intersectionTop = Math.max(first.y, second.y);
+  const intersectionRight = Math.min(
+    first.x + first.width,
+    second.x + second.width,
+  );
+  const intersectionBottom = Math.min(
+    first.y + first.height,
+    second.y + second.height,
+  );
   const intersectionWidth = Math.max(0, intersectionRight - intersectionLeft);
   const intersectionHeight = Math.max(0, intersectionBottom - intersectionTop);
-  const intersectionArea = intersectionWidth * intersectionHeight;
-  const unionArea = first.area + second.area - intersectionArea;
-  return unionArea > 0 ? intersectionArea / unionArea : 0;
+  return intersectionWidth * intersectionHeight;
 }
 
-function isSameFace(first, second) {
-  if (intersectionOverUnion(first.bounds, second.bounds) >= FACE_DEDUPE_IOU) {
-    return true;
+function isSameDetectorFace(first, second) {
+  const intersection = boxIntersection(first.box, second.box);
+  const firstArea = boxArea(first.box);
+  const secondArea = boxArea(second.box);
+  const union = firstArea + secondArea - intersection;
+  const iou = union > 0 ? intersection / union : 0;
+  const ioMinimum =
+    Math.min(firstArea, secondArea) > 0
+      ? intersection / Math.min(firstArea, secondArea)
+      : 0;
+  return iou > FACE_DEDUPE_IOU || ioMinimum > FACE_DEDUPE_IOMIN;
+}
+
+function mergeDetectorFaces(candidates) {
+  const merged = candidates.map((candidate) => ({
+    ...candidate,
+    box: { ...candidate.box },
+  }));
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    outer: for (let firstIndex = 0; firstIndex < merged.length; firstIndex += 1) {
+      for (
+        let secondIndex = firstIndex + 1;
+        secondIndex < merged.length;
+        secondIndex += 1
+      ) {
+        const first = merged[firstIndex];
+        const second = merged[secondIndex];
+        if (!isSameDetectorFace(first, second)) {
+          continue;
+        }
+
+        const left = Math.min(first.box.x, second.box.x);
+        const top = Math.min(first.box.y, second.box.y);
+        const right = Math.max(
+          first.box.x + first.box.width,
+          second.box.x + second.box.width,
+        );
+        const bottom = Math.max(
+          first.box.y + first.box.height,
+          second.box.y + second.box.height,
+        );
+        const best = first.score >= second.score ? first : second;
+        merged[firstIndex] = {
+          ...best,
+          box: {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+          },
+          score: Math.max(first.score, second.score),
+          hits: first.hits + second.hits,
+          fullHit: first.fullHit || second.fullHit,
+        };
+        merged.splice(secondIndex, 1);
+        changed = true;
+        break outer;
+      }
+    }
   }
 
-  const distance = Math.hypot(
-    first.bounds.centerX - second.bounds.centerX,
-    first.bounds.centerY - second.bounds.centerY,
-  );
-  const minimumSize = Math.min(
-    first.bounds.width,
-    first.bounds.height,
-    second.bounds.width,
-    second.bounds.height,
-  );
-  return distance <= minimumSize * FACE_DEDUPE_CENTER_RATIO;
-}
-
-function mergeDetections(detections) {
-  const merged = [];
-  detections
-    .sort((first, second) => second.quality - first.quality)
-    .forEach((candidate) => {
-      if (!merged.some((existing) => isSameFace(existing, candidate))) {
-        merged.push(candidate);
-      }
-    });
-
   return merged
-    .sort(
-      (first, second) =>
-        first.bounds.centerY - second.bounds.centerY ||
-        first.bounds.centerX - second.bounds.centerX,
+    .filter(
+      (face) =>
+        face.fullHit || face.score >= STRONG_SINGLE_SCORE || face.hits >= 2,
     )
+    .sort((first, second) => boxArea(second.box) - boxArea(first.box))
     .slice(0, MAX_AUTO_FACES);
 }
 
-function createRenderedTile(sourceCanvas, tile) {
-  const renderScale = Math.min(
-    DETECTION_TILE_RENDER_SIZE / tile.width,
-    DETECTION_TILE_RENDER_SIZE / tile.height,
-  );
+function createDetectorTile(sourceCanvas, tile) {
   const tileCanvas = document.createElement("canvas");
-  tileCanvas.width = Math.max(1, Math.round(tile.width * renderScale));
-  tileCanvas.height = Math.max(1, Math.round(tile.height * renderScale));
+  tileCanvas.width = DETECTION_TILE_RENDER_SIZE;
+  tileCanvas.height = DETECTION_TILE_RENDER_SIZE;
   const tileContext = tileCanvas.getContext("2d");
   tileContext.imageSmoothingEnabled = true;
   tileContext.imageSmoothingQuality = "high";
@@ -899,14 +978,211 @@ function createRenderedTile(sourceCanvas, tile) {
     tile.height,
     0,
     0,
-    tileCanvas.width,
-    tileCanvas.height,
+    DETECTION_TILE_RENDER_SIZE,
+    DETECTION_TILE_RENDER_SIZE,
   );
   return tileCanvas;
 }
 
+function drawReplicatedExpressionCrop(targetContext, crop) {
+  const source = state.image;
+  const size = EXPRESSION_CROP_SIZE;
+  const scale = size / crop.side;
+  const left = clamp(crop.x, 0, state.imageWidth);
+  const top = clamp(crop.y, 0, state.imageHeight);
+  const right = clamp(crop.x + crop.side, 0, state.imageWidth);
+  const bottom = clamp(crop.y + crop.side, 0, state.imageHeight);
+  const sourceWidth = Math.max(1, right - left);
+  const sourceHeight = Math.max(1, bottom - top);
+  const targetX = (left - crop.x) * scale;
+  const targetY = (top - crop.y) * scale;
+  const targetWidth = sourceWidth * scale;
+  const targetHeight = sourceHeight * scale;
+
+  targetContext.fillStyle = "#808080";
+  targetContext.fillRect(0, 0, size, size);
+  targetContext.drawImage(
+    source,
+    left,
+    top,
+    sourceWidth,
+    sourceHeight,
+    targetX,
+    targetY,
+    targetWidth,
+    targetHeight,
+  );
+
+  if (targetX > 0) {
+    targetContext.drawImage(
+      source,
+      left,
+      top,
+      1,
+      sourceHeight,
+      0,
+      targetY,
+      targetX,
+      targetHeight,
+    );
+  }
+  if (targetX + targetWidth < size) {
+    targetContext.drawImage(
+      source,
+      Math.max(0, right - 1),
+      top,
+      1,
+      sourceHeight,
+      targetX + targetWidth,
+      targetY,
+      size - targetX - targetWidth,
+      targetHeight,
+    );
+  }
+  if (targetY > 0) {
+    targetContext.drawImage(
+      source,
+      left,
+      top,
+      sourceWidth,
+      1,
+      targetX,
+      0,
+      targetWidth,
+      targetY,
+    );
+  }
+  if (targetY + targetHeight < size) {
+    targetContext.drawImage(
+      source,
+      left,
+      Math.max(0, bottom - 1),
+      sourceWidth,
+      1,
+      targetX,
+      targetY + targetHeight,
+      targetWidth,
+      size - targetY - targetHeight,
+    );
+  }
+  if (targetX > 0 && targetY > 0) {
+    targetContext.drawImage(source, left, top, 1, 1, 0, 0, targetX, targetY);
+  }
+  if (targetX + targetWidth < size && targetY > 0) {
+    targetContext.drawImage(
+      source,
+      Math.max(0, right - 1),
+      top,
+      1,
+      1,
+      targetX + targetWidth,
+      0,
+      size - targetX - targetWidth,
+      targetY,
+    );
+  }
+  if (targetX > 0 && targetY + targetHeight < size) {
+    targetContext.drawImage(
+      source,
+      left,
+      Math.max(0, bottom - 1),
+      1,
+      1,
+      0,
+      targetY + targetHeight,
+      targetX,
+      size - targetY - targetHeight,
+    );
+  }
+  if (
+    targetX + targetWidth < size &&
+    targetY + targetHeight < size
+  ) {
+    targetContext.drawImage(
+      source,
+      Math.max(0, right - 1),
+      Math.max(0, bottom - 1),
+      1,
+      1,
+      targetX + targetWidth,
+      targetY + targetHeight,
+      size - targetX - targetWidth,
+      size - targetY - targetHeight,
+    );
+  }
+}
+
+function createExpressionCrop(face) {
+  const centerX = face.box.x + face.box.width / 2;
+  const centerY = face.box.y + face.box.height / 2;
+  const side = Math.max(face.box.width, face.box.height) * EXPRESSION_CROP_SCALE;
+  const crop = {
+    x: centerX - side / 2,
+    y: centerY - side / 2,
+    side,
+  };
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = EXPRESSION_CROP_SIZE;
+  cropCanvas.height = EXPRESSION_CROP_SIZE;
+  const cropContext = cropCanvas.getContext("2d");
+  cropContext.imageSmoothingEnabled = true;
+  cropContext.imageSmoothingQuality = "high";
+  drawReplicatedExpressionCrop(cropContext, crop);
+  return { canvas: cropCanvas, crop };
+}
+
 function nextFrame() {
   return new Promise((resolve) => window.requestAnimationFrame(resolve));
+}
+
+function detectorFaceToAnnotation(face) {
+  const rotation =
+    face.eyeLeft && face.eyeRight
+      ? Math.atan2(
+          face.eyeRight.y - face.eyeLeft.y,
+          face.eyeRight.x - face.eyeLeft.x,
+        )
+      : 0;
+  return {
+    id: makeId(),
+    expression: "happy",
+    confidence: face.score,
+    emoji: UNICODE_EMOJI.happy,
+    x: face.box.x + face.box.width / 2,
+    y: face.box.y + face.box.height / 2 + face.box.height * 0.025,
+    size: clamp(
+      Math.max(face.box.width * 1.55, face.box.height * 1.4),
+      36,
+      Math.max(state.imageWidth, state.imageHeight) * 0.6,
+    ),
+    rotation: clamp(rotation, -0.21, 0.21),
+    source: "auto",
+  };
+}
+
+function selectExpressionLandmarks(result) {
+  return (result.faceLandmarks || [])
+    .map((landmarks, index) => ({
+      landmarks,
+      categories: result.faceBlendshapes?.[index]?.categories || [],
+      bounds: getLandmarkBounds(landmarks, 1, 1),
+    }))
+    .filter(
+      (face) =>
+        Math.abs(face.bounds.centerX - 0.5) < 0.2 &&
+        Math.abs(face.bounds.centerY - 0.5) < 0.22 &&
+        face.bounds.width > 0.2 &&
+        face.bounds.width < 0.85,
+    )
+    .sort((first, second) => second.bounds.area - first.bounds.area)[0];
+}
+
+function mapCropLandmarksToImage(landmarks, crop) {
+  return landmarks.map((landmark) => ({
+    ...landmark,
+    x: clamp((crop.x + landmark.x * crop.side) / state.imageWidth, 0, 1),
+    y: clamp((crop.y + landmark.y * crop.side) / state.imageHeight, 0, 1),
+  }));
 }
 
 function faceToAnnotation(landmarks, blendshapeCategories) {
@@ -942,6 +1218,47 @@ function faceToAnnotation(landmarks, blendshapeCategories) {
   };
 }
 
+function ensureVisionFileset() {
+  if (!state.visionPromise) {
+    state.visionPromise = FilesetResolver.forVisionTasks(WASM_URL).catch(
+      (error) => {
+        state.visionPromise = null;
+        throw error;
+      },
+    );
+  }
+  return state.visionPromise;
+}
+
+async function ensureFaceDetector() {
+  if (state.faceDetector) {
+    return state.faceDetector;
+  }
+  if (state.faceDetectorPromise) {
+    return state.faceDetectorPromise;
+  }
+
+  state.faceDetectorPromise = (async () => {
+    setStatus("正在加载人脸检测模型…");
+    const vision = await ensureVisionFileset();
+    const detector = await FaceDetector.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: FACE_DETECTOR_MODEL_URL,
+      },
+      runningMode: "IMAGE",
+      minDetectionConfidence: DETECTOR_MIN_CONFIDENCE,
+      minSuppressionThreshold: 0.3,
+    });
+    state.faceDetector = detector;
+    return detector;
+  })().catch((error) => {
+    state.faceDetectorPromise = null;
+    throw error;
+  });
+
+  return state.faceDetectorPromise;
+}
+
 async function ensureFaceLandmarker() {
   if (state.faceLandmarker) {
     return state.faceLandmarker;
@@ -952,13 +1269,13 @@ async function ensureFaceLandmarker() {
 
   state.faceLandmarkerPromise = (async () => {
     setStatus("正在加载表情识别模型…");
-    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    const vision = await ensureVisionFileset();
     const landmarker = await FaceLandmarker.createFromOptions(vision, {
       baseOptions: {
-        modelAssetPath: MODEL_URL,
+        modelAssetPath: FACE_LANDMARKER_MODEL_URL,
       },
       runningMode: "IMAGE",
-      numFaces: MAX_AUTO_FACES,
+      numFaces: 1,
       minFaceDetectionConfidence: 0.35,
       minFacePresenceConfidence: 0.35,
       minTrackingConfidence: 0.35,
@@ -966,15 +1283,144 @@ async function ensureFaceLandmarker() {
       outputFacialTransformationMatrixes: true,
     });
     state.faceLandmarker = landmarker;
-    state.modelError = false;
     return landmarker;
   })().catch((error) => {
     state.faceLandmarkerPromise = null;
-    state.modelError = true;
     throw error;
   });
 
   return state.faceLandmarkerPromise;
+}
+
+async function detectFacesWithDetector(detector) {
+  const detectionCanvas = createDetectionCanvas();
+  const sourceWidth = detectionCanvas.width;
+  const sourceHeight = detectionCanvas.height;
+  const candidates = [];
+  const startedAt = performance.now();
+  const fullCrop = {
+    x: 0,
+    y: 0,
+    width: sourceWidth,
+    height: sourceHeight,
+    inputWidth: sourceWidth,
+    inputHeight: sourceHeight,
+  };
+
+  setStatus("正在检测整张图片…");
+  await nextFrame();
+  candidates.push(
+    ...collectDetectorCandidates(
+      detector.detect(detectionCanvas),
+      fullCrop,
+      sourceWidth,
+      sourceHeight,
+      true,
+    ),
+  );
+
+  const jobs = buildDetectorJobs(sourceWidth, sourceHeight);
+  let timedOut = false;
+  for (let index = 0; index < jobs.length; index += 1) {
+    if (performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS) {
+      timedOut = true;
+      break;
+    }
+
+    if (index % 8 === 0) {
+      setStatus("正在检测人脸 " + (index + 1) + "/" + jobs.length + "…");
+      await nextFrame();
+    }
+    const job = jobs[index];
+    const tileCanvas = createDetectorTile(detectionCanvas, job);
+    candidates.push(
+      ...collectDetectorCandidates(
+        detector.detect(tileCanvas),
+        {
+          ...job,
+          inputWidth: DETECTION_TILE_RENDER_SIZE,
+          inputHeight: DETECTION_TILE_RENDER_SIZE,
+        },
+        sourceWidth,
+        sourceHeight,
+        false,
+      ),
+    );
+  }
+
+  return {
+    faces: mergeDetectorFaces(candidates),
+    startedAt,
+    timedOut,
+  };
+}
+
+async function fallbackToWholeImageLandmarker() {
+  setStatus("人脸检测器不可用，正在使用兼容模式…");
+  const landmarker = await ensureFaceLandmarker();
+  await landmarker.setOptions({ numFaces: MAX_EXPRESSION_FACES });
+  try {
+    const detectionCanvas = createDetectionCanvas();
+    const result = landmarker.detect(detectionCanvas);
+    return (result.faceLandmarks || [])
+      .slice(0, MAX_EXPRESSION_FACES)
+      .map((landmarks, index) =>
+        faceToAnnotation(
+          landmarks,
+          result.faceBlendshapes?.[index]?.categories || [],
+        ),
+      );
+  } finally {
+    await landmarker.setOptions({ numFaces: 1 });
+  }
+}
+
+async function refineExpressionAnnotations(
+  faces,
+  annotations,
+  landmarker,
+  startedAt,
+) {
+  const count = Math.min(faces.length, MAX_EXPRESSION_FACES);
+  let recognized = 0;
+  let timedOut = false;
+
+  for (let index = 0; index < count; index += 1) {
+    if (performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS) {
+      timedOut = true;
+      break;
+    }
+
+    setStatus("正在识别表情 " + (index + 1) + "/" + count + "…");
+    await nextFrame();
+    try {
+      const { canvas: cropCanvas, crop } = createExpressionCrop(faces[index]);
+      const result = landmarker.detect(cropCanvas);
+      const selectedFace = selectExpressionLandmarks(result);
+      if (!selectedFace) {
+        continue;
+      }
+      const globalLandmarks = mapCropLandmarksToImage(
+        selectedFace.landmarks,
+        crop,
+      );
+      const refined = faceToAnnotation(
+        globalLandmarks,
+        selectedFace.categories,
+      );
+      const originalId = annotations[index].id;
+      Object.assign(annotations[index], refined, {
+        id: originalId,
+        source: "auto",
+      });
+      recognized += 1;
+      draw();
+    } catch (error) {
+      console.warn("单张人脸表情识别失败", error);
+    }
+  }
+
+  return { recognized, timedOut };
 }
 
 async function recognizeFaces() {
@@ -985,94 +1431,26 @@ async function recognizeFaces() {
   setDetecting(true);
   setStatus("正在识别人脸和表情…");
   try {
-    const landmarker = await ensureFaceLandmarker();
-    const detectionCanvas = createDetectionCanvas();
-    const fullCrop = {
-      x: 0,
-      y: 0,
-      width: detectionCanvas.width,
-      height: detectionCanvas.height,
-    };
-    const tiles = buildDetectionTiles(
-      detectionCanvas.width,
-      detectionCanvas.height,
-    );
-    const totalPasses = 1 + tiles.length;
-    const startedAt = performance.now();
-    const detections = [];
-
-    setStatus("正在检测整张图片（1/" + totalPasses + "）…");
-    await nextFrame();
-    detections.push(
-      ...collectDetections(
-        landmarker.detect(detectionCanvas),
-        fullCrop,
-        detectionCanvas.width,
-        detectionCanvas.height,
-      ),
-    );
-
-    let timedOut = false;
-    for (let index = 0; index < tiles.length; index += 1) {
-      if (performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS) {
-        timedOut = true;
-        break;
-      }
-
-      const tile = tiles[index];
+    let detectorResult;
+    try {
+      const detector = await ensureFaceDetector();
+      detectorResult = await detectFacesWithDetector(detector);
+    } catch (detectorError) {
+      console.warn("人脸检测器不可用，尝试兼容模式", detectorError);
+      const fallbackAnnotations = await fallbackToWholeImageLandmarker();
+      state.annotations = fallbackAnnotations;
+      state.selectedId = fallbackAnnotations[0]?.id || null;
+      updateControls();
+      draw();
       setStatus(
-        "正在检测分块 " + (index + 2) + "/" + totalPasses + "…",
+        fallbackAnnotations.length
+          ? "已回退识别 " + fallbackAnnotations.length + " 张脸 · Unicode Emoji"
+          : "未检测到可识别的人脸",
       );
-      await nextFrame();
-      const tileCanvas = createRenderedTile(detectionCanvas, tile);
-      detections.push(
-        ...collectDetections(
-          landmarker.detect(tileCanvas),
-          tile,
-          detectionCanvas.width,
-          detectionCanvas.height,
-        ),
-      );
+      return;
     }
 
-    if (
-      !detections.length &&
-      !timedOut &&
-      performance.now() - startedAt < DETECTION_TIME_BUDGET_MS
-    ) {
-      const fineTiles = takeEvenlyDistributed(
-        buildDetectionTiles(
-          detectionCanvas.width,
-          detectionCanvas.height,
-          FINE_DETECTION_TILE_SIZE,
-        ),
-        Math.max(0, MAX_DETECTION_TILES - tiles.length),
-      );
-
-      for (let index = 0; index < fineTiles.length; index += 1) {
-        if (performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS) {
-          timedOut = true;
-          break;
-        }
-
-        setStatus(
-          "正在放大检测细分区域 " + (index + 1) + "/" + fineTiles.length + "…",
-        );
-        await nextFrame();
-        const tile = fineTiles[index];
-        const tileCanvas = createRenderedTile(detectionCanvas, tile);
-        detections.push(
-          ...collectDetections(
-            landmarker.detect(tileCanvas),
-            tile,
-            detectionCanvas.width,
-            detectionCanvas.height,
-          ),
-        );
-      }
-    }
-
-    const faces = mergeDetections(detections);
+    const faces = detectorResult.faces;
     if (!faces.length) {
       state.annotations = [];
       state.selectedId = null;
@@ -1082,25 +1460,49 @@ async function recognizeFaces() {
       return;
     }
 
-    state.annotations = faces.map((face) =>
-      faceToAnnotation(
-        face.landmarks,
-        face.blendshapeCategories,
-      ),
-    );
+    state.annotations = faces.map(detectorFaceToAnnotation);
     state.selectedId = state.annotations[0]?.id || null;
     updateControls();
     draw();
-    const labels = state.annotations
-      .map((annotation) => EMOTION_LABELS[annotation.expression])
-      .join("、");
+    await nextFrame();
+
+    let expressionResult = { recognized: 0, timedOut: false };
+    let landmarkerFailed = false;
+    if (
+      performance.now() - detectorResult.startedAt <
+      DETECTION_TIME_BUDGET_MS
+    ) {
+      try {
+        const landmarker = await ensureFaceLandmarker();
+        expressionResult = await refineExpressionAnnotations(
+          faces,
+          state.annotations,
+          landmarker,
+          detectorResult.startedAt,
+        );
+      } catch (landmarkerError) {
+        landmarkerFailed = true;
+        console.warn("表情识别模型不可用，保留开心贴图", landmarkerError);
+      }
+    } else {
+      expressionResult.timedOut = true;
+    }
+
+    updateControls();
+    draw();
+    const defaultHappyCount = faces.length - expressionResult.recognized;
     setStatus(
-      "已识别 " +
-        state.annotations.length +
-        " 张脸 · " +
-        labels +
-        " · 分块检测" +
-        (timedOut ? "（已达到时间上限）" : "") +
+      "检测到 " +
+        faces.length +
+        " 张脸 · 表情识别 " +
+        expressionResult.recognized +
+        " 张 · 其余 " +
+        defaultHappyCount +
+        " 张默认开心" +
+        (detectorResult.timedOut || expressionResult.timedOut
+          ? "（已达到时间上限）"
+          : "") +
+        (landmarkerFailed ? "（表情模型不可用）" : "") +
         " · Unicode Emoji",
     );
   } catch (error) {

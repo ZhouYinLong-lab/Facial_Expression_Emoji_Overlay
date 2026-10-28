@@ -43,6 +43,17 @@ const BORDER_HIT_SIZE = 10;
 const STAGE_PADDING = 28;
 const MIN_ZOOM_RATIO = 0.25;
 const MAX_ZOOM_RATIO = 12;
+const MAX_AUTO_FACES = 30;
+const MAX_DETECTION_DIMENSION = 2400;
+const DETECTION_TILE_SIZE = 960;
+const FINE_DETECTION_TILE_SIZE = 640;
+const DETECTION_TILE_OVERLAP = 0.25;
+const DETECTION_TILE_RENDER_SIZE = 1280;
+const MAX_DETECTION_TILES = 12;
+const DETECTION_TIME_BUDGET_MS = 9000;
+const MIN_DETECTED_FACE_SIZE = 18;
+const FACE_DEDUPE_IOU = 0.35;
+const FACE_DEDUPE_CENTER_RATIO = 0.45;
 
 const state = {
   image: null,
@@ -674,15 +685,238 @@ function midpoint(first, second) {
   };
 }
 
+function getLandmarkBounds(landmarks, width, height) {
+  const xs = landmarks.map((landmark) => landmark.x * width);
+  const ys = landmarks.map((landmark) => landmark.y * height);
+  const left = clamp(Math.min(...xs), 0, width);
+  const right = clamp(Math.max(...xs), 0, width);
+  const top = clamp(Math.min(...ys), 0, height);
+  const bottom = clamp(Math.max(...ys), 0, height);
+
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+    area: Math.max(0, right - left) * Math.max(0, bottom - top),
+    centerX: (left + right) / 2,
+    centerY: (top + bottom) / 2,
+  };
+}
+
+function createDetectionCanvas() {
+  const scale = Math.min(
+    1,
+    MAX_DETECTION_DIMENSION / Math.max(state.imageWidth, state.imageHeight),
+  );
+  const detectionCanvas = document.createElement("canvas");
+  detectionCanvas.width = Math.max(1, Math.round(state.imageWidth * scale));
+  detectionCanvas.height = Math.max(1, Math.round(state.imageHeight * scale));
+  const detectionContext = detectionCanvas.getContext("2d");
+  detectionContext.imageSmoothingEnabled = true;
+  detectionContext.imageSmoothingQuality = "high";
+  detectionContext.drawImage(
+    state.image,
+    0,
+    0,
+    detectionCanvas.width,
+    detectionCanvas.height,
+  );
+  return detectionCanvas;
+}
+
+function buildTileStarts(length, tileSize = DETECTION_TILE_SIZE) {
+  if (length <= tileSize) {
+    return [0];
+  }
+
+  const step = tileSize * (1 - DETECTION_TILE_OVERLAP);
+  const starts = [0];
+  while (true) {
+    const next = starts[starts.length - 1] + step;
+    if (next + tileSize >= length) {
+      break;
+    }
+    starts.push(Math.round(next));
+  }
+
+  const finalStart = length - tileSize;
+  if (finalStart > starts[starts.length - 1]) {
+    starts.push(finalStart);
+  }
+  return starts;
+}
+
+function takeEvenlyDistributed(items, limit) {
+  if (items.length <= limit) {
+    return items;
+  }
+  if (limit <= 0) {
+    return [];
+  }
+  if (limit === 1) {
+    return [items[Math.floor(items.length / 2)]];
+  }
+
+  return Array.from({ length: limit }, (_, index) => {
+    const itemIndex = Math.round((index * (items.length - 1)) / (limit - 1));
+    return items[itemIndex];
+  });
+}
+
+function buildDetectionTiles(
+  width,
+  height,
+  tileSize = DETECTION_TILE_SIZE,
+) {
+  if (width <= tileSize && height <= tileSize) {
+    return [];
+  }
+
+  const columns = buildTileStarts(width, tileSize);
+  const rows = buildTileStarts(height, tileSize);
+  const tiles = [];
+  rows.forEach((y) => {
+    columns.forEach((x) => {
+      tiles.push({
+        x,
+        y,
+        width: Math.min(tileSize, width - x),
+        height: Math.min(tileSize, height - y),
+      });
+    });
+  });
+  return takeEvenlyDistributed(tiles, MAX_DETECTION_TILES);
+}
+
+function mapLandmarksToImage(landmarks, crop, sourceWidth, sourceHeight) {
+  return landmarks.map((landmark) => ({
+    ...landmark,
+    x: clamp((crop.x + landmark.x * crop.width) / sourceWidth, 0, 1),
+    y: clamp((crop.y + landmark.y * crop.height) / sourceHeight, 0, 1),
+  }));
+}
+
+function collectDetections(result, crop, sourceWidth, sourceHeight) {
+  return (result.faceLandmarks || [])
+    .map((landmarks, index) => {
+      const globalLandmarks = mapLandmarksToImage(
+        landmarks,
+        crop,
+        sourceWidth,
+        sourceHeight,
+      );
+      const bounds = getLandmarkBounds(
+        globalLandmarks,
+        state.imageWidth,
+        state.imageHeight,
+      );
+      const localBounds = getLandmarkBounds(landmarks, 1, 1);
+
+      if (
+        Math.min(bounds.width, bounds.height) < MIN_DETECTED_FACE_SIZE
+      ) {
+        return null;
+      }
+
+      return {
+        landmarks: globalLandmarks,
+        blendshapeCategories: result.faceBlendshapes?.[index]?.categories || [],
+        bounds,
+        quality: localBounds.area,
+      };
+    })
+    .filter(Boolean);
+}
+
+function intersectionOverUnion(first, second) {
+  const intersectionLeft = Math.max(first.left, second.left);
+  const intersectionTop = Math.max(first.top, second.top);
+  const intersectionRight = Math.min(first.right, second.right);
+  const intersectionBottom = Math.min(first.bottom, second.bottom);
+  const intersectionWidth = Math.max(0, intersectionRight - intersectionLeft);
+  const intersectionHeight = Math.max(0, intersectionBottom - intersectionTop);
+  const intersectionArea = intersectionWidth * intersectionHeight;
+  const unionArea = first.area + second.area - intersectionArea;
+  return unionArea > 0 ? intersectionArea / unionArea : 0;
+}
+
+function isSameFace(first, second) {
+  if (intersectionOverUnion(first.bounds, second.bounds) >= FACE_DEDUPE_IOU) {
+    return true;
+  }
+
+  const distance = Math.hypot(
+    first.bounds.centerX - second.bounds.centerX,
+    first.bounds.centerY - second.bounds.centerY,
+  );
+  const minimumSize = Math.min(
+    first.bounds.width,
+    first.bounds.height,
+    second.bounds.width,
+    second.bounds.height,
+  );
+  return distance <= minimumSize * FACE_DEDUPE_CENTER_RATIO;
+}
+
+function mergeDetections(detections) {
+  const merged = [];
+  detections
+    .sort((first, second) => second.quality - first.quality)
+    .forEach((candidate) => {
+      if (!merged.some((existing) => isSameFace(existing, candidate))) {
+        merged.push(candidate);
+      }
+    });
+
+  return merged
+    .sort(
+      (first, second) =>
+        first.bounds.centerY - second.bounds.centerY ||
+        first.bounds.centerX - second.bounds.centerX,
+    )
+    .slice(0, MAX_AUTO_FACES);
+}
+
+function createRenderedTile(sourceCanvas, tile) {
+  const renderScale = Math.min(
+    DETECTION_TILE_RENDER_SIZE / tile.width,
+    DETECTION_TILE_RENDER_SIZE / tile.height,
+  );
+  const tileCanvas = document.createElement("canvas");
+  tileCanvas.width = Math.max(1, Math.round(tile.width * renderScale));
+  tileCanvas.height = Math.max(1, Math.round(tile.height * renderScale));
+  const tileContext = tileCanvas.getContext("2d");
+  tileContext.imageSmoothingEnabled = true;
+  tileContext.imageSmoothingQuality = "high";
+  tileContext.drawImage(
+    sourceCanvas,
+    tile.x,
+    tile.y,
+    tile.width,
+    tile.height,
+    0,
+    0,
+    tileCanvas.width,
+    tileCanvas.height,
+  );
+  return tileCanvas;
+}
+
+function nextFrame() {
+  return new Promise((resolve) => window.requestAnimationFrame(resolve));
+}
+
 function faceToAnnotation(landmarks, blendshapeCategories) {
-  const xs = landmarks.map((landmark) => landmark.x);
-  const ys = landmarks.map((landmark) => landmark.y);
-  const minX = clamp(Math.min(...xs), 0, 1);
-  const maxX = clamp(Math.max(...xs), 0, 1);
-  const minY = clamp(Math.min(...ys), 0, 1);
-  const maxY = clamp(Math.max(...ys), 0, 1);
-  const width = (maxX - minX) * state.imageWidth;
-  const height = (maxY - minY) * state.imageHeight;
+  const bounds = getLandmarkBounds(
+    landmarks,
+    state.imageWidth,
+    state.imageHeight,
+  );
+  const width = bounds.width;
+  const height = bounds.height;
   const expressionResult = classifyExpression(blendshapeCategories);
   const leftEye = midpoint(landmarks[33], landmarks[133]);
   const rightEye = midpoint(landmarks[263], landmarks[362]);
@@ -696,10 +930,10 @@ function faceToAnnotation(landmarks, blendshapeCategories) {
     expression: expressionResult.expression,
     confidence: expressionResult.confidence,
     emoji: UNICODE_EMOJI[expressionResult.expression],
-    x: ((minX + maxX) / 2) * state.imageWidth,
-    y: (((minY + maxY) / 2) + (maxY - minY) * 0.035) * state.imageHeight,
+    x: bounds.centerX,
+    y: bounds.centerY + height * 0.035,
     size: clamp(
-      Math.max(width * 1.7, height * 1.45),
+      Math.max(width * 1.9, height * 1.85),
       36,
       Math.max(state.imageWidth, state.imageHeight) * 0.6,
     ),
@@ -724,10 +958,10 @@ async function ensureFaceLandmarker() {
         modelAssetPath: MODEL_URL,
       },
       runningMode: "IMAGE",
-      numFaces: 10,
-      minFaceDetectionConfidence: 0.5,
-      minFacePresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
+      numFaces: MAX_AUTO_FACES,
+      minFaceDetectionConfidence: 0.35,
+      minFacePresenceConfidence: 0.35,
+      minTrackingConfidence: 0.35,
       outputFaceBlendshapes: true,
       outputFacialTransformationMatrixes: true,
     });
@@ -751,9 +985,94 @@ async function recognizeFaces() {
   setDetecting(true);
   setStatus("正在识别人脸和表情…");
   try {
-    await ensureFaceLandmarker();
-    const result = state.faceLandmarker.detect(state.image);
-    const faces = result.faceLandmarks || [];
+    const landmarker = await ensureFaceLandmarker();
+    const detectionCanvas = createDetectionCanvas();
+    const fullCrop = {
+      x: 0,
+      y: 0,
+      width: detectionCanvas.width,
+      height: detectionCanvas.height,
+    };
+    const tiles = buildDetectionTiles(
+      detectionCanvas.width,
+      detectionCanvas.height,
+    );
+    const totalPasses = 1 + tiles.length;
+    const startedAt = performance.now();
+    const detections = [];
+
+    setStatus("正在检测整张图片（1/" + totalPasses + "）…");
+    await nextFrame();
+    detections.push(
+      ...collectDetections(
+        landmarker.detect(detectionCanvas),
+        fullCrop,
+        detectionCanvas.width,
+        detectionCanvas.height,
+      ),
+    );
+
+    let timedOut = false;
+    for (let index = 0; index < tiles.length; index += 1) {
+      if (performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS) {
+        timedOut = true;
+        break;
+      }
+
+      const tile = tiles[index];
+      setStatus(
+        "正在检测分块 " + (index + 2) + "/" + totalPasses + "…",
+      );
+      await nextFrame();
+      const tileCanvas = createRenderedTile(detectionCanvas, tile);
+      detections.push(
+        ...collectDetections(
+          landmarker.detect(tileCanvas),
+          tile,
+          detectionCanvas.width,
+          detectionCanvas.height,
+        ),
+      );
+    }
+
+    if (
+      !detections.length &&
+      !timedOut &&
+      performance.now() - startedAt < DETECTION_TIME_BUDGET_MS
+    ) {
+      const fineTiles = takeEvenlyDistributed(
+        buildDetectionTiles(
+          detectionCanvas.width,
+          detectionCanvas.height,
+          FINE_DETECTION_TILE_SIZE,
+        ),
+        Math.max(0, MAX_DETECTION_TILES - tiles.length),
+      );
+
+      for (let index = 0; index < fineTiles.length; index += 1) {
+        if (performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS) {
+          timedOut = true;
+          break;
+        }
+
+        setStatus(
+          "正在放大检测细分区域 " + (index + 1) + "/" + fineTiles.length + "…",
+        );
+        await nextFrame();
+        const tile = fineTiles[index];
+        const tileCanvas = createRenderedTile(detectionCanvas, tile);
+        detections.push(
+          ...collectDetections(
+            landmarker.detect(tileCanvas),
+            tile,
+            detectionCanvas.width,
+            detectionCanvas.height,
+          ),
+        );
+      }
+    }
+
+    const faces = mergeDetections(detections);
     if (!faces.length) {
       state.annotations = [];
       state.selectedId = null;
@@ -763,10 +1082,10 @@ async function recognizeFaces() {
       return;
     }
 
-    state.annotations = faces.map((landmarks, index) =>
+    state.annotations = faces.map((face) =>
       faceToAnnotation(
-        landmarks,
-        result.faceBlendshapes?.[index]?.categories || [],
+        face.landmarks,
+        face.blendshapeCategories,
       ),
     );
     state.selectedId = state.annotations[0]?.id || null;
@@ -780,6 +1099,8 @@ async function recognizeFaces() {
         state.annotations.length +
         " 张脸 · " +
         labels +
+        " · 分块检测" +
+        (timedOut ? "（已达到时间上限）" : "") +
         " · Unicode Emoji",
     );
   } catch (error) {

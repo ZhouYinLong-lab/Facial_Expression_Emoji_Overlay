@@ -19,20 +19,13 @@
             <span class="button-icon" aria-hidden="true">✦</span>
             识别并贴图
           </button>
-          <div class="style-picker" role="group" aria-label="Emoji 风格">
-            <span class="style-label">风格</span>
-            <button class="style-option is-active" type="button" data-style="sticker" aria-pressed="true">
-              <span class="style-swatch sticker-swatch" aria-hidden="true">☺</span>
-              手绘
-            </button>
-            <button class="style-option" type="button" data-style="pixel" aria-pressed="false">
-              <span class="style-swatch pixel-swatch" aria-hidden="true">▪</span>
-              像素
-            </button>
-            <button class="style-option" type="button" data-style="flat" aria-pressed="false">
-              <span class="style-swatch flat-swatch" aria-hidden="true">●</span>
-              扁平
-            </button>
+          <div class="unicode-picker" role="group" aria-label="修改选中贴图的表情">
+            <span class="style-label">Unicode</span>
+            <button class="emoji-option" type="button" data-expression="happy" aria-label="开心">😄</button>
+            <button class="emoji-option" type="button" data-expression="sad" aria-label="悲伤">😢</button>
+            <button class="emoji-option" type="button" data-expression="angry" aria-label="生气">😠</button>
+            <button class="emoji-option" type="button" data-expression="surprised" aria-label="惊讶">😮</button>
+            <button class="emoji-option" type="button" data-expression="neutral" aria-label="中性">😐</button>
           </div>
           <div class="zoom-controls" aria-label="视图缩放">
             <button id="zoomOutButton" class="button icon-button" type="button" disabled aria-label="缩小" title="缩小">−</button>

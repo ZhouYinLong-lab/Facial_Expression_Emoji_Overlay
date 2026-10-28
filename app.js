@@ -12,14 +12,13 @@ const resetViewButton = document.querySelector("#resetViewButton");
 const zoomInButton = document.querySelector("#zoomInButton");
 const emptyState = document.querySelector("#emptyState");
 const statusText = document.querySelector("#statusText");
-const styleButtons = [...document.querySelectorAll("[data-style]")];
+const unicodeButtons = [...document.querySelectorAll("[data-expression]")];
 
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
 const WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/wasm";
 
-const EMOTIONS = ["happy", "sad", "angry", "surprised", "neutral"];
 const EMOTION_LABELS = {
   happy: "开心",
   sad: "悲伤",
@@ -27,38 +26,17 @@ const EMOTION_LABELS = {
   surprised: "惊讶",
   neutral: "中性",
 };
-const STYLE_LABELS = {
-  sticker: "手绘",
-  pixel: "像素",
-  flat: "扁平",
-};
-const STYLE_PACKS = {
-  sticker: {
-    happy: "./assets/emoji/sticker/happy.svg",
-    sad: "./assets/emoji/sticker/sad.svg",
-    angry: "./assets/emoji/sticker/angry.svg",
-    surprised: "./assets/emoji/sticker/surprised.svg",
-    neutral: "./assets/emoji/sticker/neutral.svg",
-  },
-  pixel: {
-    happy: "./assets/emoji/pixel/happy.svg",
-    sad: "./assets/emoji/pixel/sad.svg",
-    angry: "./assets/emoji/pixel/angry.svg",
-    surprised: "./assets/emoji/pixel/surprised.svg",
-    neutral: "./assets/emoji/pixel/neutral.svg",
-  },
-  flat: {
-    happy: "./assets/emoji/flat/happy.svg",
-    sad: "./assets/emoji/flat/sad.svg",
-    angry: "./assets/emoji/flat/angry.svg",
-    surprised: "./assets/emoji/flat/surprised.svg",
-    neutral: "./assets/emoji/flat/neutral.svg",
-  },
+const UNICODE_EMOJI = {
+  happy: "😄",
+  sad: "😢",
+  angry: "😠",
+  surprised: "😮",
+  neutral: "😐",
 };
 
-const DEFAULT_EMOJI_DISPLAY_SIZE = 96;
+const DEFAULT_EMOJI_DISPLAY_SIZE = 84;
 const MIN_EMOJI_DISPLAY_SIZE = 24;
-const BOUNDS_RATIO = 1.16;
+const BOUNDS_RATIO = 1.05;
 const HANDLE_SIZE = 9;
 const HANDLE_HIT_SIZE = 14;
 const BORDER_HIT_SIZE = 10;
@@ -83,12 +61,9 @@ const state = {
   selectedId: null,
   lastEmojiSize: null,
   drag: null,
-  style: "sticker",
   detecting: false,
   faceLandmarker: null,
   faceLandmarkerPromise: null,
-  modelError: false,
-  assetCache: new Map(),
 };
 
 function setStatus(text) {
@@ -123,6 +98,13 @@ function updateControls() {
   resetViewButton.disabled = !hasImage;
   zoomInButton.disabled = !hasImage;
   emptyState.classList.toggle("hidden", hasImage);
+  const selected = getSelectedAnnotation();
+  unicodeButtons.forEach((button) => {
+    const active = Boolean(selected && selected.expression === button.dataset.expression);
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = !selected;
+  });
 }
 
 function setDetecting(isDetecting) {
@@ -136,20 +118,6 @@ function setDetecting(isDetecting) {
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
-}
-
-function randomIndex(max) {
-  if (window.crypto && window.crypto.getRandomValues) {
-    const array = new Uint32Array(1);
-    window.crypto.getRandomValues(array);
-    return array[0] % max;
-  }
-
-  return Math.floor(Math.random() * max);
-}
-
-function pickManualExpression() {
-  return EMOTIONS[randomIndex(EMOTIONS.length)];
 }
 
 function makeId() {
@@ -290,60 +258,21 @@ function fitCanvasToStage() {
   draw();
 }
 
-function getAssetPath(style, expression) {
-  const pack = STYLE_PACKS[style] || STYLE_PACKS.sticker;
-  return pack[expression] || pack.neutral;
-}
-
-function loadAsset(path) {
-  if (state.assetCache.has(path)) {
-    const cached = state.assetCache.get(path);
-    return cached instanceof Promise ? cached : Promise.resolve(cached);
-  }
-
-  const promise = new Promise((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => {
-      state.assetCache.set(path, image);
-      resolve(image);
-    };
-    image.onerror = () => reject(new Error("无法加载贴图资源：" + path));
-    image.src = path;
-  });
-  state.assetCache.set(path, promise);
-  return promise;
-}
-
-async function preloadStyle(style) {
-  const paths = Object.values(STYLE_PACKS[style]);
-  await Promise.all(paths.map((path) => loadAsset(path)));
-}
-
 function drawAnnotation(targetCtx, annotation, scale, offsetX, offsetY) {
-  const path = getAssetPath(annotation.style, annotation.expression);
-  const cachedAsset = state.assetCache.get(path);
-  if (!cachedAsset) {
-    loadAsset(path)
-      .then(() => draw())
-      .catch(() => {});
-    return;
-  }
-
-  if (cachedAsset instanceof Promise) {
-    cachedAsset.then(() => draw()).catch(() => {});
-    return;
-  }
-
   const size = Math.max(1, annotation.size * scale);
   const x = (offsetX || 0) + annotation.x * scale;
   const y = (offsetY || 0) + annotation.y * scale;
 
   targetCtx.save();
+  targetCtx.font =
+    "normal " +
+    size +
+    'px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+  targetCtx.textAlign = "center";
+  targetCtx.textBaseline = "middle";
   targetCtx.translate(x, y);
   targetCtx.rotate(annotation.rotation || 0);
-  targetCtx.imageSmoothingEnabled = true;
-  targetCtx.imageSmoothingQuality = "high";
-  targetCtx.drawImage(cachedAsset, -size / 2, -size / 2, size, size);
+  targetCtx.fillText(annotation.emoji, 0, 0);
   targetCtx.restore();
 }
 
@@ -537,14 +466,13 @@ function addManualEmojiAt(point) {
     return;
   }
 
-  const expression = pickManualExpression();
+  const expression = "happy";
   const size = state.lastEmojiSize || DEFAULT_EMOJI_DISPLAY_SIZE / state.scale;
   const annotation = {
     id: makeId(),
     expression,
+    emoji: UNICODE_EMOJI[expression],
     confidence: 1,
-    style: state.style,
-    assetKey: expression,
     x: imagePoint.x,
     y: imagePoint.y,
     size,
@@ -553,9 +481,6 @@ function addManualEmojiAt(point) {
   };
   state.annotations.push(annotation);
   state.selectedId = annotation.id;
-  preloadStyle(state.style)
-    .then(() => draw())
-    .catch(() => {});
   updateControls();
   setStatus(imageStatusText());
   draw();
@@ -713,31 +638,32 @@ function classifyExpression(categories) {
   const browInnerUp = scores.get("browInnerUp") || 0;
   const jawOpen = scores.get("jawOpen") || 0;
 
-  const candidates = [
-    { expression: "happy", score: smile * 0.75 + cheekSquint * 0.25 },
-    { expression: "sad", score: frown * 0.5 + browInnerUp * 0.5 },
-    {
-      expression: "angry",
-      score: browDown * 0.45 + eyeSquint * 0.25 + mouthPress * 0.3,
-    },
-    {
-      expression: "surprised",
-      score: jawOpen * 0.45 + eyeWide * 0.3 + browInnerUp * 0.25,
-    },
-  ].sort((a, b) => b.score - a.score);
+  const happyScore = smile * 0.8 + cheekSquint * 0.2;
+  const surprisedScore = Math.min(jawOpen, eyeWide);
+  const angryScore = Math.min(
+    browDown,
+    Math.max(mouthPress, eyeSquint),
+  );
+  const sadScore = Math.min(frown, browInnerUp);
 
-  const top = candidates[0];
-  const second = candidates[1] || { score: 0 };
-  if (!top || top.score < 0.35 || top.score - second.score < 0.08) {
-    return {
-      expression: "neutral",
-      confidence: clamp(1 - (top ? top.score : 0), 0.45, 0.9),
-    };
+  if (surprisedScore >= 0.42) {
+    return { expression: "surprised", confidence: surprisedScore };
+  }
+  if (angryScore >= 0.34) {
+    return { expression: "angry", confidence: angryScore };
+  }
+  if (sadScore >= 0.34) {
+    return { expression: "sad", confidence: sadScore };
+  }
+  if (happyScore >= 0.2) {
+    return { expression: "happy", confidence: happyScore };
   }
 
+  // For this playful sticker workflow, an uncertain face defaults to happy
+  // instead of showing a misleading negative emotion.
   return {
-    expression: top.expression,
-    confidence: clamp(top.score, 0.35, 1),
+    expression: "happy",
+    confidence: clamp(happyScore, 0.35, 0.75),
   };
 }
 
@@ -769,12 +695,15 @@ function faceToAnnotation(landmarks, blendshapeCategories) {
     id: makeId(),
     expression: expressionResult.expression,
     confidence: expressionResult.confidence,
-    style: state.style,
-    assetKey: expressionResult.expression,
+    emoji: UNICODE_EMOJI[expressionResult.expression],
     x: ((minX + maxX) / 2) * state.imageWidth,
     y: ((minY + maxY) / 2) * state.imageHeight,
-    size: Math.max(width, height) * 1.12,
-    rotation: clamp(rotation, -0.45, 0.45),
+    size: clamp(
+      width * 1.05,
+      36,
+      Math.max(state.imageWidth, state.imageHeight) * 0.3,
+    ),
+    rotation: clamp(rotation, -0.21, 0.21),
     source: "auto",
   };
 }
@@ -822,7 +751,7 @@ async function recognizeFaces() {
   setDetecting(true);
   setStatus("正在识别人脸和表情…");
   try {
-    await Promise.all([ensureFaceLandmarker(), preloadStyle(state.style)]);
+    await ensureFaceLandmarker();
     const result = state.faceLandmarker.detect(state.image);
     const faces = result.faceLandmarks || [];
     if (!faces.length) {
@@ -851,9 +780,7 @@ async function recognizeFaces() {
         state.annotations.length +
         " 张脸 · " +
         labels +
-        " · " +
-        STYLE_LABELS[state.style] +
-        "风格",
+        " · Unicode Emoji",
     );
   } catch (error) {
     console.error(error);
@@ -863,34 +790,24 @@ async function recognizeFaces() {
   }
 }
 
-async function selectStyle(style) {
-  if (!STYLE_PACKS[style] || state.style === style) {
+function selectExpression(expression) {
+  if (!UNICODE_EMOJI[expression]) {
     return;
   }
 
-  state.style = style;
-  styleButtons.forEach((button) => {
-    const active = button.dataset.style === style;
-    button.classList.toggle("is-active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
-
-  try {
-    await preloadStyle(style);
-    state.annotations.forEach((annotation) => {
-      annotation.style = style;
-      annotation.assetKey = annotation.expression;
-    });
-    draw();
-    setStatus(
-      state.image
-        ? imageStatusText() + " · 已切换为" + STYLE_LABELS[style] + "风格"
-        : "已选择" + STYLE_LABELS[style] + "风格",
-    );
-  } catch (error) {
-    console.error(error);
-    setStatus("风格资源加载失败，请稍后重试");
+  const selected = getSelectedAnnotation();
+  if (!selected) {
+    setStatus("请先选中一个贴图，再修改它的表情");
+    return;
   }
+
+  selected.expression = expression;
+  selected.emoji = UNICODE_EMOJI[expression];
+  updateControls();
+  draw();
+  setStatus(
+    imageStatusText() + " · 已将选中贴图改为" + EMOTION_LABELS[expression],
+  );
 }
 
 function downloadBlob(blob, fileName) {
@@ -906,13 +823,6 @@ function downloadBlob(blob, fileName) {
 
 async function exportEditedImage() {
   if (!state.image) {
-    return;
-  }
-
-  try {
-    await preloadStyle(state.style);
-  } catch (error) {
-    setStatus("贴图资源加载失败，无法导出");
     return;
   }
 
@@ -958,8 +868,10 @@ clearButton.addEventListener("click", () => {
   draw();
 });
 
-styleButtons.forEach((button) => {
-  button.addEventListener("click", () => selectStyle(button.dataset.style));
+unicodeButtons.forEach((button) => {
+  button.addEventListener("click", () =>
+    selectExpression(button.dataset.expression),
+  );
 });
 
 zoomOutButton.addEventListener("click", () => {
@@ -1021,6 +933,7 @@ canvas.addEventListener("pointerdown", (event) => {
     state.selectedId = null;
     startPan(point, event.pointerId);
     canvas.setPointerCapture(event.pointerId);
+    updateControls();
     draw();
     return;
   }
@@ -1033,6 +946,7 @@ canvas.addEventListener("pointerdown", (event) => {
     startMove(hit.annotation, point, event.pointerId);
   }
   canvas.setPointerCapture(event.pointerId);
+  updateControls();
   draw();
 });
 

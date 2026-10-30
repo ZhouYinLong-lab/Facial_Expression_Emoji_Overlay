@@ -90,6 +90,7 @@ Facial_Expression_Emoji_Overlay/
 ├── app.js                    # 检测、表情规则、画布编辑与导出
 ├── assets/
 │   ├── demo.png              # README 展示图
+│   ├── favicon.png           # A1 金毛项目图标，网页与 favicon 共用
 │   ├── emoji/                # 后续自定义表情资源预留目录
 │   └── models/
 │       ├── blaze_face_full_range.tflite

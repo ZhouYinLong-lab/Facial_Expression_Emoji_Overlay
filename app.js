@@ -10,6 +10,12 @@ const stage = document.querySelector("#canvasStage");
 const imageInput = document.querySelector("#imageInput");
 const recognizeButton = document.querySelector("#recognizeButton");
 const recognizeLabel = document.querySelector("#recognizeLabel");
+const processingModeSelect = document.querySelector("#processingMode");
+const maskButtons = [...document.querySelectorAll("[data-mask-type]")];
+const unicodePicker = document.querySelector("#unicodePicker");
+const repairButton = document.querySelector("#repairButton");
+const repairLabel = document.querySelector("#repairLabel");
+const scanStats = document.querySelector("#scanStats");
 const exportButton = document.querySelector("#exportButton");
 const clearButton = document.querySelector("#clearButton");
 const zoomOutButton = document.querySelector("#zoomOutButton");
@@ -44,6 +50,18 @@ const UNICODE_EMOJI = {
   angry: "😠",
   surprised: "😮",
   neutral: "😐",
+};
+const MASK_LABELS = {
+  emoji: "Emoji",
+  blur: "模糊",
+  pixelate: "像素",
+  solid: "纯色",
+};
+const DEFAULT_MASK_COLOR = "#171914";
+const PROCESSING_MODE_LABELS = {
+  "auto-expression": "自动表情",
+  "all-happy": "全部开心",
+  random: "随机表情",
 };
 
 const DEFAULT_EMOJI_DISPLAY_SIZE = 84;
@@ -90,6 +108,15 @@ const state = {
   lastEmojiSize: null,
   drag: null,
   detecting: false,
+  processingMode: "auto-expression",
+  maskType: "emoji",
+  maskColor: DEFAULT_MASK_COLOR,
+  repairMode: false,
+  batchFiles: [],
+  batchIndex: 0,
+  batchTotal: 0,
+  batchRunning: false,
+  detectedFaces: 0,
   visionPromise: null,
   faceDetector: null,
   faceDetectorPromise: null,
@@ -98,7 +125,11 @@ const state = {
 };
 
 function setStatus(text) {
-  statusText.textContent = text;
+  const hasBatchPrefix = text.startsWith("批量处理");
+  const prefix = state.batchRunning && !hasBatchPrefix
+    ? `批量处理 ${state.batchIndex}/${state.batchTotal} · `
+    : "";
+  statusText.textContent = prefix + text;
   if (text.includes("正在")) {
     statusText.dataset.state = "loading";
   } else if (text.includes("失败") || text.includes("不可用")) {
@@ -133,29 +164,49 @@ function imageStatusText() {
 
 function updateControls() {
   const hasImage = Boolean(state.image);
-  exportButton.disabled = !hasImage;
-  clearButton.disabled = !hasImage || state.annotations.length === 0;
-  recognizeButton.disabled = !hasImage || state.detecting;
+  const busy = state.detecting || state.batchRunning;
+  imageInput.disabled = busy;
+  exportButton.disabled = !hasImage || busy;
+  clearButton.disabled = !hasImage || busy || state.annotations.length === 0;
+  recognizeButton.disabled = !hasImage || busy;
+  repairButton.disabled = !hasImage || busy;
+  processingModeSelect.disabled = busy;
   zoomOutButton.disabled = !hasImage;
   resetViewButton.disabled = !hasImage;
   zoomInButton.disabled = !hasImage;
   emptyState.classList.toggle("hidden", hasImage);
   const selected = getSelectedAnnotation();
+  scanStats.textContent = state.detectedFaces
+    ? `检测到 ${state.detectedFaces} 张脸 · 当前 ${state.annotations.length} 个遮挡`
+    : (state.annotations.length ? `当前 ${state.annotations.length} 个遮挡` : "尚未检测");
   selectionHint.textContent = selected
-    ? "已选中“" + EMOTION_LABELS[selected.expression] + "”贴图"
-    : "先在画布中选中一个贴图";
+    ? `已选中“${EMOTION_LABELS[selected.expression] || "遮挡"}”贴图 · ${MASK_LABELS[selected.maskType || "emoji"]}`
+    : `先选中贴图，或选择${MASK_LABELS[state.maskType]}作为新贴图默认效果`;
+  const currentMaskType = selected?.maskType || state.maskType;
+  maskButtons.forEach((button) => {
+    const active = currentMaskType === button.dataset.maskType;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = busy;
+  });
+  unicodePicker.hidden = currentMaskType !== "emoji";
   unicodeButtons.forEach((button) => {
     const active = Boolean(selected && selected.expression === button.dataset.expression);
     button.classList.toggle("is-active", active);
     button.setAttribute("aria-pressed", String(active));
-    button.disabled = !selected;
+    button.disabled = busy || !selected || currentMaskType !== "emoji";
   });
+  repairButton.classList.toggle("is-active", state.repairMode);
+  repairLabel.textContent = state.repairMode ? "完成补脸" : "补脸";
+  recognizeLabel.textContent = state.detecting
+    ? (state.batchRunning ? "批量处理中…" : "正在识别…")
+    : (state.batchFiles.length > 1 ? "批量识别并下载" : "识别并贴图");
 }
 
 function setDetecting(isDetecting) {
   state.detecting = isDetecting;
   recognizeButton.classList.toggle("is-loading", isDetecting);
-  recognizeLabel.textContent = isDetecting ? "正在识别…" : "识别并贴图";
+  recognizeLabel.textContent = isDetecting ? (state.batchRunning ? "批量处理中…" : "正在识别…") : "识别并贴图";
   updateControls();
 }
 
@@ -301,21 +352,76 @@ function fitCanvasToStage() {
   draw();
 }
 
-function drawAnnotation(targetCtx, annotation, scale, offsetX, offsetY) {
+function drawAnnotation(targetCtx, annotation, scale, offsetX, offsetY, source = state.image) {
   const size = Math.max(1, annotation.size * scale);
   const x = (offsetX || 0) + annotation.x * scale;
   const y = (offsetY || 0) + annotation.y * scale;
+  const maskType = annotation.maskType || "emoji";
 
   targetCtx.save();
-  targetCtx.font =
-    "normal " +
-    size +
-    'px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
-  targetCtx.textAlign = "center";
-  targetCtx.textBaseline = "middle";
   targetCtx.translate(x, y);
   targetCtx.rotate(annotation.rotation || 0);
-  targetCtx.fillText(annotation.emoji, 0, 0);
+
+  if (maskType === "emoji") {
+    targetCtx.font =
+      "normal " +
+      size +
+      'px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+    targetCtx.textAlign = "center";
+    targetCtx.textBaseline = "middle";
+    targetCtx.fillText(annotation.emoji || UNICODE_EMOJI.happy, 0, 0);
+  } else {
+    targetCtx.beginPath();
+    targetCtx.ellipse(0, 0, size * 0.49, size * 0.49, 0, 0, Math.PI * 2);
+    targetCtx.clip();
+    if (maskType === "solid") {
+      targetCtx.fillStyle = annotation.maskColor || DEFAULT_MASK_COLOR;
+      targetCtx.fillRect(-size / 2, -size / 2, size, size);
+    } else if (source) {
+      const sourceSize = Math.max(1, annotation.size);
+      const sourceX = annotation.x - sourceSize / 2;
+      const sourceY = annotation.y - sourceSize / 2;
+      if (maskType === "blur") {
+        targetCtx.filter = `blur(${Math.max(5, size * 0.08)}px)`;
+        targetCtx.drawImage(
+          source,
+          sourceX,
+          sourceY,
+          sourceSize,
+          sourceSize,
+          -size / 2,
+          -size / 2,
+          size,
+          size,
+        );
+      } else {
+        const pixelCanvas = document.createElement("canvas");
+        pixelCanvas.width = 14;
+        pixelCanvas.height = 14;
+        const pixelContext = pixelCanvas.getContext("2d");
+        pixelContext.imageSmoothingEnabled = false;
+        pixelContext.drawImage(
+          source,
+          sourceX,
+          sourceY,
+          sourceSize,
+          sourceSize,
+          0,
+          0,
+          pixelCanvas.width,
+          pixelCanvas.height,
+        );
+        targetCtx.imageSmoothingEnabled = false;
+        targetCtx.drawImage(
+          pixelCanvas,
+          -size / 2,
+          -size / 2,
+          size,
+          size,
+        );
+      }
+    }
+  }
   targetCtx.restore();
 }
 
@@ -373,6 +479,27 @@ function draw() {
   if (selected) {
     drawSelection(selected);
   }
+  if (state.drag?.kind === "repair") {
+    drawRepairSelection(state.drag.startPoint, state.drag.currentPoint);
+  }
+}
+
+function drawRepairSelection(startPoint, currentPoint) {
+  if (!startPoint || !currentPoint) {
+    return;
+  }
+  const left = Math.min(startPoint.x, currentPoint.x);
+  const top = Math.min(startPoint.y, currentPoint.y);
+  const width = Math.abs(currentPoint.x - startPoint.x);
+  const height = Math.abs(currentPoint.y - startPoint.y);
+  ctx.save();
+  ctx.fillStyle = "rgba(99, 91, 255, 0.14)";
+  ctx.fillRect(left, top, width, height);
+  ctx.strokeStyle = "#635bff";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([8, 5]);
+  ctx.strokeRect(left, top, width, height);
+  ctx.restore();
 }
 
 function getBounds(annotation, scale) {
@@ -470,41 +597,74 @@ function hitAnnotation(point) {
   return null;
 }
 
-function loadImageFile(file) {
+function loadImageFile(file, options = {}) {
   if (!file) {
-    return;
+    return Promise.reject(new Error("没有图片文件"));
   }
-
   if (!file.type.startsWith("image/")) {
     setStatus("请选择 JPG、PNG、WebP 等图片文件");
-    return;
+    return Promise.reject(new Error("不是图片文件"));
   }
 
-  const url = URL.createObjectURL(file);
-  const image = new Image();
-  image.onload = () => {
-    URL.revokeObjectURL(url);
-    state.image = image;
-    state.imageName = file.name || "image";
-    state.imageWidth = image.naturalWidth;
-    state.imageHeight = image.naturalHeight;
-    state.annotations = [];
-    state.selectedId = null;
-    state.lastEmojiSize = null;
-    state.panX = 0;
-    state.panY = 0;
-    state.viewReady = false;
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      state.image = image;
+      state.imageName = file.name || "image";
+      state.imageFile = file;
+      state.imageWidth = image.naturalWidth;
+      state.imageHeight = image.naturalHeight;
+      state.annotations = [];
+      state.detectedFaces = 0;
+      state.selectedId = null;
+      state.lastEmojiSize = null;
+      state.panX = 0;
+      state.panY = 0;
+      state.viewReady = false;
+      state.repairMode = false;
 
-    updateControls();
-    fitCanvasToStage();
-    setStatus(imageStatusText() + " · 点击“识别并贴图”开始");
-  };
-  image.onerror = () => {
-    URL.revokeObjectURL(url);
-    setStatus("图片读取失败");
-  };
+      updateControls();
+      fitCanvasToStage();
+      if (!options.silent) {
+        setStatus(imageStatusText() + " · 点击“识别并贴图”开始");
+      }
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      setStatus("图片读取失败");
+      reject(new Error("图片读取失败"));
+    };
+    image.src = url;
+  });
+}
 
-  image.src = url;
+function createAnnotation({
+  expression = "happy",
+  confidence = 1,
+  x,
+  y,
+  size,
+  rotation = 0,
+  source = "manual",
+  maskType = state.maskType,
+  maskColor = state.maskColor,
+}) {
+  return {
+    id: makeId(),
+    expression,
+    emoji: UNICODE_EMOJI[expression] || UNICODE_EMOJI.happy,
+    confidence,
+    x,
+    y,
+    size,
+    rotation,
+    source,
+    maskType,
+    maskColor,
+  };
 }
 
 function addManualEmojiAt(point) {
@@ -516,21 +676,54 @@ function addManualEmojiAt(point) {
 
   const expression = "happy";
   const size = state.lastEmojiSize || DEFAULT_EMOJI_DISPLAY_SIZE / state.scale;
-  const annotation = {
-    id: makeId(),
+  const annotation = createAnnotation({
     expression,
-    emoji: UNICODE_EMOJI[expression],
     confidence: 1,
     x: imagePoint.x,
     y: imagePoint.y,
     size,
-    rotation: 0,
     source: "manual",
-  };
+  });
   state.annotations.push(annotation);
   state.selectedId = annotation.id;
   updateControls();
   setStatus(imageStatusText());
+  draw();
+}
+
+function addManualAnnotationFromRect(startPoint, endPoint) {
+  const first = canvasToImage(startPoint);
+  const second = canvasToImage(endPoint);
+  if (!isInsideImage(first) && !isInsideImage(second)) {
+    setStatus("请在图片范围内拖拽补脸区域");
+    return;
+  }
+  const left = clamp(Math.min(first.x, second.x), 0, state.imageWidth);
+  const top = clamp(Math.min(first.y, second.y), 0, state.imageHeight);
+  const right = clamp(Math.max(first.x, second.x), 0, state.imageWidth);
+  const bottom = clamp(Math.max(first.y, second.y), 0, state.imageHeight);
+  const width = right - left;
+  const height = bottom - top;
+  if (Math.max(width, height) < 8 / state.scale) {
+    setStatus("补脸区域太小，请拖动更大的矩形");
+    return;
+  }
+  const size = Math.max(
+    width,
+    height,
+    MIN_EMOJI_DISPLAY_SIZE / state.scale,
+  );
+  const annotation = createAnnotation({
+    x: clamp((left + right) / 2, 0, state.imageWidth),
+    y: clamp((top + bottom) / 2, 0, state.imageHeight),
+    size,
+    source: "manual",
+  });
+  state.annotations.push(annotation);
+  state.selectedId = annotation.id;
+  state.lastEmojiSize = size;
+  updateControls();
+  setStatus(imageStatusText() + " · 已补充 1 个遮挡");
   draw();
 }
 
@@ -573,6 +766,15 @@ function startPan(point, pointerId) {
   };
 }
 
+function startRepair(point, pointerId) {
+  state.drag = {
+    kind: "repair",
+    pointerId,
+    startPoint: point,
+    currentPoint: point,
+  };
+}
+
 function updateDrag(point) {
   if (!state.drag) {
     return;
@@ -582,6 +784,11 @@ function updateDrag(point) {
     state.panX = state.drag.startPanX + point.x - state.drag.startPoint.x;
     state.panY = state.drag.startPanY + point.y - state.drag.startPoint.y;
     clampPan();
+    draw();
+    return;
+  }
+  if (state.drag.kind === "repair") {
+    state.drag.currentPoint = point;
     draw();
     return;
   }
@@ -632,6 +839,10 @@ function updateCursor(event) {
     canvas.style.cursor = "default";
     return;
   }
+  if (state.repairMode) {
+    canvas.style.cursor = "crosshair";
+    return;
+  }
   const point = getCanvasPoint(event);
   canvas.style.cursor =
     hitSelectedBorder(point) || hitAnnotation(point) ? "move" : "grab";
@@ -642,10 +853,15 @@ function finishDrag() {
     return;
   }
 
-  const annotation = state.annotations.find(
-    (item) => item.id === state.drag.id,
-  );
-  if (annotation && state.drag.kind === "resize") {
+  const drag = state.drag;
+  if (drag.kind === "repair") {
+    addManualAnnotationFromRect(drag.startPoint, drag.currentPoint);
+    state.drag = null;
+    draw();
+    return;
+  }
+  const annotation = state.annotations.find((item) => item.id === drag.id);
+  if (annotation && drag.kind === "resize") {
     state.lastEmojiSize = annotation.size;
   }
   state.drag = null;
@@ -1166,11 +1382,9 @@ function detectorFaceToAnnotation(face) {
           face.eyeRight.x - face.eyeLeft.x,
         )
       : 0;
-  return {
-    id: makeId(),
+  return createAnnotation({
     expression: "happy",
     confidence: face.score,
-    emoji: UNICODE_EMOJI.happy,
     x: face.box.x + face.box.width / 2,
     y: face.box.y + face.box.height / 2 + face.box.height * 0.025,
     size: clamp(
@@ -1180,7 +1394,7 @@ function detectorFaceToAnnotation(face) {
     ),
     rotation: clamp(rotation, -0.21, 0.21),
     source: "auto",
-  };
+  });
 }
 
 function selectExpressionLandmarks(result) {
@@ -1224,11 +1438,9 @@ function faceToAnnotation(landmarks, blendshapeCategories) {
     (rightEye.x - leftEye.x) * state.imageWidth,
   );
 
-  return {
-    id: makeId(),
+  return createAnnotation({
     expression: expressionResult.expression,
     confidence: expressionResult.confidence,
-    emoji: UNICODE_EMOJI[expressionResult.expression],
     x: bounds.centerX,
     y: bounds.centerY + height * 0.035,
     size: clamp(
@@ -1238,7 +1450,7 @@ function faceToAnnotation(landmarks, blendshapeCategories) {
     ),
     rotation: clamp(rotation, -0.21, 0.21),
     source: "auto",
-  };
+  });
 }
 
 function ensureVisionFileset() {
@@ -1435,6 +1647,8 @@ async function refineExpressionAnnotations(
       Object.assign(annotations[index], refined, {
         id: originalId,
         source: "auto",
+        maskType: annotations[index].maskType || "emoji",
+        maskColor: annotations[index].maskColor || DEFAULT_MASK_COLOR,
       });
       recognized += 1;
       draw();
@@ -1446,12 +1660,26 @@ async function refineExpressionAnnotations(
   return { recognized, timedOut };
 }
 
-async function recognizeFaces() {
-  if (!state.image || state.detecting) {
+function applyRandomExpressions(annotations) {
+  const expressions = Object.keys(UNICODE_EMOJI);
+  annotations.forEach((annotation) => {
+    const expression = expressions[Math.floor(Math.random() * expressions.length)];
+    annotation.expression = expression;
+    annotation.emoji = UNICODE_EMOJI[expression];
+    annotation.confidence = 1;
+  });
+}
+
+async function recognizeFaces(options = {}) {
+  const internal = options.internal === true;
+  if (!state.image || (state.detecting && !internal)) {
     return;
   }
 
-  setDetecting(true);
+  if (!internal) {
+    state.repairMode = false;
+    setDetecting(true);
+  }
   setStatus("正在识别人脸和表情…");
   try {
     let detectorResult;
@@ -1461,7 +1689,16 @@ async function recognizeFaces() {
     } catch (detectorError) {
       console.warn("人脸检测器不可用，尝试兼容模式", detectorError);
       const fallbackAnnotations = await fallbackToWholeImageLandmarker();
+      if (state.processingMode === "all-happy") {
+        fallbackAnnotations.forEach((annotation) => {
+          annotation.expression = "happy";
+          annotation.emoji = UNICODE_EMOJI.happy;
+        });
+      } else if (state.processingMode === "random") {
+        applyRandomExpressions(fallbackAnnotations);
+      }
       state.annotations = fallbackAnnotations;
+      state.detectedFaces = fallbackAnnotations.length;
       state.selectedId = fallbackAnnotations[0]?.id || null;
       updateControls();
       draw();
@@ -1476,6 +1713,7 @@ async function recognizeFaces() {
     const faces = detectorResult.faces;
     if (!faces.length) {
       state.annotations = [];
+      state.detectedFaces = 0;
       state.selectedId = null;
       updateControls();
       draw();
@@ -1484,6 +1722,7 @@ async function recognizeFaces() {
     }
 
     state.annotations = faces.map(detectorFaceToAnnotation);
+    state.detectedFaces = faces.length;
     state.selectedId = state.annotations[0]?.id || null;
     updateControls();
     draw();
@@ -1491,7 +1730,11 @@ async function recognizeFaces() {
 
     let expressionResult = { recognized: 0, timedOut: false };
     let landmarkerFailed = false;
-    if (
+    if (state.processingMode === "random") {
+      applyRandomExpressions(state.annotations);
+      expressionResult.recognized = state.annotations.length;
+    } else if (
+      state.processingMode === "auto-expression" &&
       performance.now() - detectorResult.startedAt <
       DETECTION_TIME_BUDGET_MS
     ) {
@@ -1507,13 +1750,14 @@ async function recognizeFaces() {
         landmarkerFailed = true;
         console.warn("表情识别模型不可用，保留开心贴图", landmarkerError);
       }
-    } else {
+    } else if (state.processingMode === "auto-expression") {
       expressionResult.timedOut = true;
     }
 
     updateControls();
     draw();
     const defaultHappyCount = faces.length - expressionResult.recognized;
+    const modeText = PROCESSING_MODE_LABELS[state.processingMode];
     setStatus(
       "检测到 " +
         faces.length +
@@ -1526,13 +1770,15 @@ async function recognizeFaces() {
           ? "（已达到时间上限）"
           : "") +
         (landmarkerFailed ? "（表情模型不可用）" : "") +
-        " · Unicode Emoji",
+        " · " + modeText + " · Unicode Emoji",
     );
   } catch (error) {
     console.error(error);
     setStatus("识别服务加载失败，请检查网络后重试；手动贴图仍可用");
   } finally {
-    setDetecting(false);
+    if (!internal) {
+      setDetecting(false);
+    }
   }
 }
 
@@ -1549,11 +1795,44 @@ function selectExpression(expression) {
 
   selected.expression = expression;
   selected.emoji = UNICODE_EMOJI[expression];
+  selected.maskType = "emoji";
+  state.maskType = "emoji";
   updateControls();
   draw();
   setStatus(
     imageStatusText() + " · 已将选中贴图改为" + EMOTION_LABELS[expression],
   );
+}
+
+function selectMaskType(maskType) {
+  if (!MASK_LABELS[maskType]) {
+    return;
+  }
+  state.maskType = maskType;
+  const selected = getSelectedAnnotation();
+  if (selected) {
+    selected.maskType = maskType;
+    selected.maskColor = state.maskColor;
+  }
+  updateControls();
+  draw();
+  setStatus(
+    imageStatusText() +
+      (selected ? " · 当前贴图已切换为" : " · 新贴图默认效果：") +
+      MASK_LABELS[maskType],
+  );
+}
+
+function setRepairMode(enabled) {
+  state.repairMode = Boolean(enabled) && Boolean(state.image);
+  if (state.repairMode) {
+    state.selectedId = null;
+    setStatus("补脸模式已开启 · 在图片上拖拽矩形区域");
+  } else {
+    setStatus(imageStatusText());
+  }
+  updateControls();
+  draw();
 }
 
 function downloadBlob(blob, fileName) {
@@ -1567,9 +1846,9 @@ function downloadBlob(blob, fileName) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function exportEditedImage() {
+async function exportEditedImage(options = {}) {
   if (!state.image) {
-    return;
+    return false;
   }
 
   const output = document.createElement("canvas");
@@ -1582,25 +1861,94 @@ async function exportEditedImage() {
   state.annotations.forEach((annotation) => {
     drawAnnotation(outputCtx, annotation, 1, 0, 0);
   });
-  const baseName = state.imageName.replace(/\.[^.]+$/, "") || "image";
-  output.toBlob((blob) => {
-    if (blob) {
-      downloadBlob(blob, baseName + "-emoji.png");
-      setStatus("已导出 " + state.imageWidth + " × " + state.imageHeight + "px");
-      return;
-    }
+  const baseName = (options.fileName || state.imageName).replace(/\.[^.]+$/, "") || "image";
+  const fileName = baseName.endsWith("-emoji") ? baseName + ".png" : baseName + "-emoji.png";
+  const blob = await new Promise((resolve) => output.toBlob(resolve, "image/png"));
+  if (blob) {
+    downloadBlob(blob, fileName);
+  } else {
     const link = document.createElement("a");
     link.href = output.toDataURL("image/png");
-    link.download = baseName + "-emoji.png";
+    link.download = fileName;
     document.body.append(link);
     link.click();
     link.remove();
+  }
+  if (!options.silent) {
     setStatus("已导出 " + state.imageWidth + " × " + state.imageHeight + "px");
-  }, "image/png");
+  }
+  return true;
+}
+
+function handleInputFiles(files) {
+  const imageFiles = [...files].filter((file) => file.type.startsWith("image/"));
+  if (!imageFiles.length) {
+    setStatus("请选择 JPG、PNG、WebP 等图片文件");
+    return;
+  }
+  state.batchFiles = imageFiles;
+  state.batchIndex = 0;
+  state.batchTotal = imageFiles.length;
+  loadImageFile(imageFiles[0], { silent: true })
+    .then(() => {
+      updateControls();
+      setStatus(
+        imageStatusText() +
+          (imageFiles.length > 1
+            ? ` · 已选择 ${imageFiles.length} 张照片，点击“批量识别并下载”`
+            : " · 点击“识别并贴图”开始"),
+      );
+    })
+    .catch(() => {
+      state.batchFiles = [];
+    });
+}
+
+async function processBatchFiles(files) {
+  if (state.batchRunning || !files.length) {
+    return;
+  }
+  state.batchRunning = true;
+  state.batchTotal = files.length;
+  state.batchIndex = 0;
+  state.repairMode = false;
+  setDetecting(true);
+  let success = 0;
+  const failures = [];
+  const fileNameCounts = new Map();
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      state.batchIndex = index + 1;
+      const previousCount = fileNameCounts.get(file.name) || 0;
+      fileNameCounts.set(file.name, previousCount + 1);
+      const fileName = previousCount
+        ? file.name.replace(/(\.[^.]+)$/, `-${previousCount + 1}$1`)
+        : file.name;
+      setStatus(`正在处理 ${index + 1}/${files.length}：${file.name}`);
+      try {
+        await loadImageFile(file, { silent: true });
+        await recognizeFaces({ internal: true });
+        await exportEditedImage({ silent: true, fileName });
+        success += 1;
+      } catch (error) {
+        console.error("批量处理失败", file.name, error);
+        failures.push(file.name);
+      }
+    }
+  } finally {
+    state.batchRunning = false;
+    setDetecting(false);
+  }
+  setStatus(
+    `批量完成 · 成功 ${success}/${files.length} 张` +
+      (failures.length ? ` · 失败：${failures.join("、")}` : "") +
+      " · 每张已单独下载",
+  );
 }
 
 imageInput.addEventListener("change", (event) => {
-  loadImageFile(event.target.files?.[0]);
+  handleInputFiles(event.target.files || []);
   event.target.value = "";
 });
 
@@ -1623,11 +1971,22 @@ stage.addEventListener("dragleave", (event) => {
 stage.addEventListener("drop", (event) => {
   event.preventDefault();
   stage.classList.remove("is-dragover");
-  loadImageFile(event.dataTransfer?.files?.[0]);
+  handleInputFiles(event.dataTransfer?.files || []);
 });
 
-recognizeButton.addEventListener("click", recognizeFaces);
+recognizeButton.addEventListener("click", () => {
+  if (state.batchFiles.length > 1) {
+    processBatchFiles(state.batchFiles);
+  } else {
+    recognizeFaces();
+  }
+});
 exportButton.addEventListener("click", exportEditedImage);
+repairButton.addEventListener("click", () => setRepairMode(!state.repairMode));
+processingModeSelect.addEventListener("change", (event) => {
+  state.processingMode = event.target.value;
+  setStatus(imageStatusText() + " · 已选择" + PROCESSING_MODE_LABELS[state.processingMode]);
+});
 clearButton.addEventListener("click", () => {
   state.annotations = [];
   state.selectedId = null;
@@ -1640,6 +1999,10 @@ unicodeButtons.forEach((button) => {
   button.addEventListener("click", () =>
     selectExpression(button.dataset.expression),
   );
+});
+
+maskButtons.forEach((button) => {
+  button.addEventListener("click", () => selectMaskType(button.dataset.maskType));
 });
 
 zoomOutButton.addEventListener("click", () => {
@@ -1694,6 +2057,13 @@ canvas.addEventListener("pointerdown", (event) => {
   }
 
   const point = getCanvasPoint(event);
+  if (state.repairMode && isInsideImage(canvasToImage(point))) {
+    event.preventDefault();
+    startRepair(point, event.pointerId);
+    canvas.setPointerCapture(event.pointerId);
+    draw();
+    return;
+  }
   const resizeHit = hitSelectedBorder(point);
   const hit = resizeHit || hitAnnotation(point);
   if (!hit) {

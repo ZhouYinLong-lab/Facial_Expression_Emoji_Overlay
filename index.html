@@ -89,11 +89,18 @@
               </svg>
               <span id="recognizeLabel">识别并贴图</span>
             </button>
+            <label class="field-label" for="processingMode">自动模式</label>
+            <select id="processingMode" class="select-control">
+              <option value="auto-expression">自动表情（前 6 张）</option>
+              <option value="all-happy">全部开心</option>
+              <option value="random">随机表情</option>
+            </select>
             <div class="pipeline-note" aria-label="识别流程">
               <span>人脸检测</span>
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7 4 6 6-6 6" /></svg>
               <span>前 6 张识别表情</span>
             </div>
+            <div id="scanStats" class="scan-stats" aria-live="polite">尚未检测</div>
           </section>
 
           <section class="tool-section" aria-labelledby="emojiTitle">
@@ -104,7 +111,13 @@
                 <p id="selectionHint">先在画布中选中一个贴图</p>
               </div>
             </div>
-            <div class="unicode-picker" role="group" aria-label="修改选中贴图的表情">
+            <div class="mask-picker" role="group" aria-label="选择遮挡方式">
+              <button class="mask-option is-active" type="button" data-mask-type="emoji" aria-label="Emoji 遮挡">Emoji</button>
+              <button class="mask-option" type="button" data-mask-type="blur" aria-label="模糊遮挡">模糊</button>
+              <button class="mask-option" type="button" data-mask-type="pixelate" aria-label="像素遮挡">像素</button>
+              <button class="mask-option" type="button" data-mask-type="solid" aria-label="纯色遮挡">纯色</button>
+            </div>
+            <div id="unicodePicker" class="unicode-picker" role="group" aria-label="修改选中贴图的表情">
               <button class="emoji-option" type="button" data-expression="happy" aria-label="开心" title="开心">😄</button>
               <button class="emoji-option" type="button" data-expression="sad" aria-label="悲伤" title="悲伤">😢</button>
               <button class="emoji-option" type="button" data-expression="angry" aria-label="生气" title="生气">😠</button>
@@ -114,6 +127,12 @@
           </section>
 
           <div class="panel-actions">
+            <button id="repairButton" class="button repair-button" type="button" disabled>
+              <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 4h6M4 4v6M20 20h-6M20 20v-6M20 4h-6M20 4v6M4 20h6M4 20v-6" />
+              </svg>
+              <span id="repairLabel">补脸</span>
+            </button>
             <button id="exportButton" class="button export-button" type="button" disabled>
               <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 4v12m0 0 4.5-4.5M12 16l-4.5-4.5M5 19v1h14v-1" />
@@ -174,7 +193,7 @@
         </section>
       </main>
 
-      <input id="imageInput" class="file-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif" />
+      <input id="imageInput" class="file-input" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif" />
     </div>
 
     <script type="module" src="./app.js"></script>

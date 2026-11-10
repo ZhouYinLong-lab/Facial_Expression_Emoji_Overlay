@@ -13,7 +13,7 @@
 
 ## 主要功能
 
-- 检测近景人像和多人合影，单次最多保留 80 张脸，并显示检测人数与当前遮挡数量
+- 使用 Full Range + Short Range 双检测器检测近景人像和多人合影，单次最多保留 80 张脸，并显示检测人数与当前遮挡数量
 - 对面积最大的 6 张脸进一步识别开心、悲伤、生气、惊讶和中性表情
 - 未进入表情层或判断不确定的人脸默认使用 `😄`，保证检测到就会被遮住
 - 支持“自动表情 / 全部开心 / 随机表情”三种自动模式
@@ -95,9 +95,10 @@ python -m http.server 5173 --bind 127.0.0.1
 ## 隐私与模型加载
 
 - 图片、关键点和编辑结果只存在于当前浏览器页面，不会上传到项目服务器。
-- Face Detector 和 Face Landmarker 模型存放在 `assets/models/`，由站点同源加载；“全部开心”模式不调用表情层。
+- Full Range、Short Range Face Detector 和 Face Landmarker 模型存放在 `assets/models/`，由站点同源加载；“全部开心”模式不调用表情层。
 - MediaPipe Tasks Vision 运行时通过 jsDelivr CDN 加载，因此首次打开和首次识别需要网络。
-- 两个模型都不可用时，右键手动添加、调整和 PNG 导出仍可使用。
+- 双检测器会分别处理整图和多尺度重叠分块，然后合并重复人脸；正常情况下识别时间约为单检测器版本的 1.5–2 倍。
+- 任意一个检测器加载失败时，应用会继续使用另一个；两个检测器都不可用时，会回退到 Face Landmarker，右键手动添加、调整和 PNG 导出仍可使用。
 
 > 表情分类来自面部 blendshape 的规则组合，只适合趣味图片编辑，不代表医学或心理层面的情绪判断。
 
@@ -114,6 +115,7 @@ Facial_Expression_Emoji_Overlay/
 │   ├── emoji/                # 后续自定义表情资源预留目录
 │   └── models/
 │       ├── blaze_face_full_range.tflite
+│       ├── blaze_face_short_range.tflite
 │       ├── face_landmarker.task
 │       └── README.md          # 模型来源与校验值
 └── README.md
@@ -121,9 +123,9 @@ Facial_Expression_Emoji_Overlay/
 
 ## 技术细节
 
-- **人脸检测：** MediaPipe Face Detector + BlazeFace full-range
+- **人脸检测：** MediaPipe Face Detector + BlazeFace Full Range / Short Range 双检测器
 - **表情与关键点：** MediaPipe Face Landmarker，478 个面部关键点和 blendshape
-- **多人合影：** 整图检测后按 4 个尺度做 50% 重叠分块，再通过 IoU 和交集比例去重
+- **多人合影：** 两个检测器分别整图检测并按 4 个尺度做 50% 重叠分块，再通过 IoU、交集比例和跨模型命中去重
 - **渲染：** Canvas 2D 统一绘制 Unicode Emoji、局部模糊、像素和纯色遮挡
 - **坐标：** 贴图始终保存在原图坐标系；缩放和平移只作用于预览
 - **部署：** 纯静态 GitHub Pages，无后端
@@ -134,7 +136,8 @@ Facial_Expression_Emoji_Overlay/
 
 - 侧脸、严重遮挡、模糊或小于约 10–18px 的远处人脸可能漏检。
 - Unicode Emoji 的具体外观由操作系统和浏览器决定，预览风格可能不同。
-- 为控制耗时，表情层只处理面积最大的 6 张脸，其余人脸默认开心；人脸层最多保留 80 张。
+- 为控制耗时，表情层只处理面积最大的 6 张脸，其余人脸默认开心；双检测器最多保留 80 张脸，识别耗时约为单检测器版本的 1.5–2 倍。
+- 双检测器仍可能漏掉严重遮挡、背脸、墨镜遮住关键区域或极小的远处人脸；可以使用“补脸”模式手动补充遮挡。
 - 当前版本不处理视频、摄像头实时画面、ZIP 打包、MP4 编码或 EXIF 清理。
 
 ## 路线图

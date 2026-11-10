@@ -30,8 +30,12 @@ const FACE_LANDMARKER_MODEL_URL = new URL(
   "./assets/models/face_landmarker.task",
   import.meta.url,
 ).href;
-const FACE_DETECTOR_MODEL_URL = new URL(
+const FACE_DETECTOR_FULL_RANGE_MODEL_URL = new URL(
   "./assets/models/blaze_face_full_range.tflite",
+  import.meta.url,
+).href;
+const FACE_DETECTOR_SHORT_RANGE_MODEL_URL = new URL(
+  "./assets/models/blaze_face_short_range.tflite",
   import.meta.url,
 ).href;
 const WASM_URL =
@@ -79,10 +83,24 @@ const MAX_DETECTION_DIMENSION = 2400;
 const DETECTION_TILE_SCALES = [0.62, 0.4, 0.26, 0.17];
 const DETECTION_TILE_OVERLAP = 0.5;
 const DETECTION_TILE_RENDER_SIZE = 512;
-const DETECTION_TIME_BUDGET_MS = 9000;
+const DETECTION_TIME_BUDGET_MS = 18000;
+const DETECTOR_PASS_BUDGET_MS = 9000;
+const EXPRESSION_TIME_BUDGET_MS = 6000;
 const DETECTOR_MIN_CONFIDENCE = 0.25;
-const FULL_IMAGE_MIN_SCORE = 0.55;
-const TILE_MIN_SCORE = 0.6;
+const DETECTOR_CONFIGS = {
+  fullRange: {
+    label: "Full Range",
+    modelAssetPath: FACE_DETECTOR_FULL_RANGE_MODEL_URL,
+    fullImageMinScore: 0.45,
+    tileMinScore: 0.5,
+  },
+  shortRange: {
+    label: "Short Range",
+    modelAssetPath: FACE_DETECTOR_SHORT_RANGE_MODEL_URL,
+    fullImageMinScore: 0.5,
+    tileMinScore: 0.55,
+  },
+};
 const STRONG_SINGLE_SCORE = 0.85;
 const MIN_DETECTED_FACE_SIZE = 10;
 const FACE_DEDUPE_IOU = 0.35;
@@ -118,8 +136,14 @@ const state = {
   batchRunning: false,
   detectedFaces: 0,
   visionPromise: null,
-  faceDetector: null,
-  faceDetectorPromise: null,
+  faceDetectors: {
+    fullRange: null,
+    shortRange: null,
+  },
+  faceDetectorPromises: {
+    fullRange: null,
+    shortRange: null,
+  },
   faceLandmarker: null,
   faceLandmarkerPromise: null,
 };
@@ -1045,10 +1069,27 @@ function hasPlausibleKeypoints(keypoints, box) {
   );
   const eyeMidpoint = midpoint(eyes[0], eyes[1]);
   const faceSize = Math.max(box.width, box.height);
+  const boxAspect = box.width / Math.max(1, box.height);
+  const keypointsInsideBox = keypoints.slice(0, 4).every(
+    (point) =>
+      point.x >= box.x - box.width * 0.18 &&
+      point.x <= box.x + box.width * 1.18 &&
+      point.y >= box.y - box.height * 0.18 &&
+      point.y <= box.y + box.height * 1.18,
+  );
+  const eyesAreLevel = Math.abs(eyes[1].y - eyes[0].y) < eyeDistance * 0.9;
+  const mouthIsBelowEyes = mouth.y > eyeMidpoint.y + eyeDistance * 0.2;
+  const mouthIsBelowNose = mouth.y > nose.y - eyeDistance * 0.1;
 
   return (
+    boxAspect > 0.5 &&
+    boxAspect < 1.8 &&
+    keypointsInsideBox &&
     eyeDistance > faceSize * 0.12 &&
     eyeDistance < faceSize * 0.9 &&
+    eyesAreLevel &&
+    mouthIsBelowEyes &&
+    mouthIsBelowNose &&
     Math.hypot(mouth.x - eyeMidpoint.x, mouth.y - eyeMidpoint.y) >
       eyeDistance * 0.4 &&
     Math.hypot(nose.x - eyeMidpoint.x, nose.y - eyeMidpoint.y) <
@@ -1062,12 +1103,14 @@ function collectDetectorCandidates(
   sourceWidth,
   sourceHeight,
   isFullImage,
+  detectorKey,
 ) {
   const scaleX = state.imageWidth / sourceWidth;
   const scaleY = state.imageHeight / sourceHeight;
+  const detectorConfig = DETECTOR_CONFIGS[detectorKey];
   const minimumScore = isFullImage
-    ? FULL_IMAGE_MIN_SCORE
-    : TILE_MIN_SCORE;
+    ? detectorConfig.fullImageMinScore
+    : detectorConfig.tileMinScore;
 
   return (result.detections || [])
     .map((detection) => {
@@ -1102,6 +1145,7 @@ function collectDetectorCandidates(
         score,
         hits: 1,
         fullHit: isFullImage,
+        detectorHits: [detectorKey],
         eyeLeft: eyes[0],
         eyeRight: eyes[1],
       };
@@ -1146,6 +1190,7 @@ function mergeDetectorFaces(candidates) {
   const merged = candidates.map((candidate) => ({
     ...candidate,
     box: { ...candidate.box },
+    detectorHits: [...(candidate.detectorHits || [])],
   }));
   let changed = true;
 
@@ -1174,6 +1219,12 @@ function mergeDetectorFaces(candidates) {
           second.box.y + second.box.height,
         );
         const best = first.score >= second.score ? first : second;
+        const detectorHits = [
+          ...new Set([
+            ...(first.detectorHits || []),
+            ...(second.detectorHits || []),
+          ]),
+        ];
         merged[firstIndex] = {
           ...best,
           box: {
@@ -1185,6 +1236,7 @@ function mergeDetectorFaces(candidates) {
           score: Math.max(first.score, second.score),
           hits: first.hits + second.hits,
           fullHit: first.fullHit || second.fullHit,
+          detectorHits,
         };
         merged.splice(secondIndex, 1);
         changed = true;
@@ -1196,7 +1248,10 @@ function mergeDetectorFaces(candidates) {
   return merged
     .filter(
       (face) =>
-        face.fullHit || face.score >= STRONG_SINGLE_SCORE || face.hits >= 2,
+        face.fullHit ||
+        face.score >= STRONG_SINGLE_SCORE ||
+        face.hits >= 2 ||
+        (face.detectorHits || []).length >= 2,
     )
     .sort((first, second) => boxArea(second.box) - boxArea(first.box))
     .slice(0, MAX_AUTO_FACES);
@@ -1465,33 +1520,37 @@ function ensureVisionFileset() {
   return state.visionPromise;
 }
 
-async function ensureFaceDetector() {
-  if (state.faceDetector) {
-    return state.faceDetector;
+async function ensureFaceDetector(detectorKey) {
+  const detectorConfig = DETECTOR_CONFIGS[detectorKey];
+  if (!detectorConfig) {
+    throw new Error("未知的人脸检测器：" + detectorKey);
   }
-  if (state.faceDetectorPromise) {
-    return state.faceDetectorPromise;
+  if (state.faceDetectors[detectorKey]) {
+    return state.faceDetectors[detectorKey];
+  }
+  if (state.faceDetectorPromises[detectorKey]) {
+    return state.faceDetectorPromises[detectorKey];
   }
 
-  state.faceDetectorPromise = (async () => {
-    setStatus("正在加载人脸检测模型…");
+  state.faceDetectorPromises[detectorKey] = (async () => {
+    setStatus("正在加载 " + detectorConfig.label + " 模型…");
     const vision = await ensureVisionFileset();
     const detector = await FaceDetector.createFromOptions(vision, {
       baseOptions: {
-        modelAssetPath: FACE_DETECTOR_MODEL_URL,
+        modelAssetPath: detectorConfig.modelAssetPath,
       },
       runningMode: "IMAGE",
       minDetectionConfidence: DETECTOR_MIN_CONFIDENCE,
       minSuppressionThreshold: 0.3,
     });
-    state.faceDetector = detector;
+    state.faceDetectors[detectorKey] = detector;
     return detector;
   })().catch((error) => {
-    state.faceDetectorPromise = null;
+    state.faceDetectorPromises[detectorKey] = null;
     throw error;
   });
 
-  return state.faceDetectorPromise;
+  return state.faceDetectorPromises[detectorKey];
 }
 
 async function ensureFaceLandmarker() {
@@ -1527,8 +1586,12 @@ async function ensureFaceLandmarker() {
   return state.faceLandmarkerPromise;
 }
 
-async function detectFacesWithDetector(detector) {
-  const detectionCanvas = createDetectionCanvas();
+async function detectFacesWithDetector(
+  detector,
+  detectorKey,
+  detectionCanvas,
+) {
+  const detectorConfig = DETECTOR_CONFIGS[detectorKey];
   const sourceWidth = detectionCanvas.width;
   const sourceHeight = detectionCanvas.height;
   const candidates = [];
@@ -1542,7 +1605,7 @@ async function detectFacesWithDetector(detector) {
     inputHeight: sourceHeight,
   };
 
-  setStatus("正在检测整张图片…");
+  setStatus("正在检测 " + detectorConfig.label + " · 整张图片…");
   await nextFrame();
   candidates.push(
     ...collectDetectorCandidates(
@@ -1551,42 +1614,101 @@ async function detectFacesWithDetector(detector) {
       sourceWidth,
       sourceHeight,
       true,
+      detectorKey,
     ),
   );
 
   const jobs = buildDetectorJobs(sourceWidth, sourceHeight);
   let timedOut = false;
   for (let index = 0; index < jobs.length; index += 1) {
-    if (performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS) {
+    if (performance.now() - startedAt >= DETECTOR_PASS_BUDGET_MS) {
       timedOut = true;
       break;
     }
 
-    if (index % 8 === 0) {
-      setStatus("正在检测人脸 " + (index + 1) + "/" + jobs.length + "…");
+    if (index % 4 === 0) {
+      setStatus(
+        "正在检测 " +
+          detectorConfig.label +
+          " · 区域 " +
+          (index + 1) +
+          "/" +
+          jobs.length +
+          "…",
+      );
       await nextFrame();
     }
     const job = jobs[index];
     const tileCanvas = createDetectorTile(detectionCanvas, job);
-    candidates.push(
-      ...collectDetectorCandidates(
-        detector.detect(tileCanvas),
-        {
-          ...job,
-          inputWidth: DETECTION_TILE_RENDER_SIZE,
-          inputHeight: DETECTION_TILE_RENDER_SIZE,
-        },
-        sourceWidth,
-        sourceHeight,
-        false,
-      ),
-    );
+    try {
+      candidates.push(
+        ...collectDetectorCandidates(
+          detector.detect(tileCanvas),
+          {
+            ...job,
+            inputWidth: DETECTION_TILE_RENDER_SIZE,
+            inputHeight: DETECTION_TILE_RENDER_SIZE,
+          },
+          sourceWidth,
+          sourceHeight,
+          false,
+          detectorKey,
+        ),
+      );
+    } catch (error) {
+      console.warn(detectorConfig.label + " 分块检测失败，继续下一区域", error);
+    }
   }
 
   return {
-    faces: mergeDetectorFaces(candidates),
+    candidates,
+    detectorKey,
     startedAt,
     timedOut,
+  };
+}
+
+async function detectFacesWithBothDetectors() {
+  const detectionCanvas = createDetectionCanvas();
+  const startedAt = performance.now();
+  const results = [];
+  const errors = [];
+  const detectorKeys = Object.keys(DETECTOR_CONFIGS);
+
+  for (const detectorKey of detectorKeys) {
+    try {
+      const detector = await ensureFaceDetector(detectorKey);
+      results.push(
+        await detectFacesWithDetector(
+          detector,
+          detectorKey,
+          detectionCanvas,
+        ),
+      );
+    } catch (error) {
+      errors.push({ detectorKey, error });
+      console.warn(
+        DETECTOR_CONFIGS[detectorKey].label + " 不可用，继续使用其他检测器",
+        error,
+      );
+    }
+  }
+
+  if (!results.length) {
+    throw new Error("两个检测器都不可用");
+  }
+
+  setStatus("正在合并两个检测器结果…");
+  const candidates = results.flatMap((result) => result.candidates);
+  const faces = mergeDetectorFaces(candidates);
+  return {
+    faces,
+    startedAt,
+    timedOut:
+      results.some((result) => result.timedOut) ||
+      performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS,
+    detectorKeys: results.map((result) => result.detectorKey),
+    errors,
   };
 }
 
@@ -1621,7 +1743,7 @@ async function refineExpressionAnnotations(
   let timedOut = false;
 
   for (let index = 0; index < count; index += 1) {
-    if (performance.now() - startedAt >= DETECTION_TIME_BUDGET_MS) {
+    if (performance.now() - startedAt >= EXPRESSION_TIME_BUDGET_MS) {
       timedOut = true;
       break;
     }
@@ -1684,10 +1806,9 @@ async function recognizeFaces(options = {}) {
   try {
     let detectorResult;
     try {
-      const detector = await ensureFaceDetector();
-      detectorResult = await detectFacesWithDetector(detector);
+      detectorResult = await detectFacesWithBothDetectors();
     } catch (detectorError) {
-      console.warn("人脸检测器不可用，尝试兼容模式", detectorError);
+      console.warn("双人脸检测器不可用，尝试兼容模式", detectorError);
       const fallbackAnnotations = await fallbackToWholeImageLandmarker();
       if (state.processingMode === "all-happy") {
         fallbackAnnotations.forEach((annotation) => {
@@ -1733,31 +1854,29 @@ async function recognizeFaces(options = {}) {
     if (state.processingMode === "random") {
       applyRandomExpressions(state.annotations);
       expressionResult.recognized = state.annotations.length;
-    } else if (
-      state.processingMode === "auto-expression" &&
-      performance.now() - detectorResult.startedAt <
-      DETECTION_TIME_BUDGET_MS
-    ) {
+    } else if (state.processingMode === "auto-expression") {
       try {
         const landmarker = await ensureFaceLandmarker();
         expressionResult = await refineExpressionAnnotations(
           faces,
           state.annotations,
           landmarker,
-          detectorResult.startedAt,
+          performance.now(),
         );
       } catch (landmarkerError) {
         landmarkerFailed = true;
         console.warn("表情识别模型不可用，保留开心贴图", landmarkerError);
       }
-    } else if (state.processingMode === "auto-expression") {
-      expressionResult.timedOut = true;
     }
-
     updateControls();
     draw();
     const defaultHappyCount = faces.length - expressionResult.recognized;
     const modeText = PROCESSING_MODE_LABELS[state.processingMode];
+    const detectorModeText =
+      detectorResult.detectorKeys.length === 2
+        ? "双检测器"
+        : "仅使用 " +
+          (DETECTOR_CONFIGS[detectorResult.detectorKeys[0]]?.label || "单检测器");
     setStatus(
       "检测到 " +
         faces.length +
@@ -1770,6 +1889,8 @@ async function recognizeFaces(options = {}) {
           ? "（已达到时间上限）"
           : "") +
         (landmarkerFailed ? "（表情模型不可用）" : "") +
+        " · " + detectorModeText +
+        (detectorResult.errors.length ? "（部分模型不可用）" : "") +
         " · " + modeText + " · Unicode Emoji",
     );
   } catch (error) {
